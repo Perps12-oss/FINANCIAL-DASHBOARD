@@ -200,7 +200,8 @@ function _parseTransactions(rows) {
         dateObj: dateVal,
         description: desc.toString().trim(),
         amount: amt,
-        category: indices.category !== -1 ? (row[indices.category] || 'Uncategorized') : 'Uncategorized'
+        category: indices.category !== -1 ? (row[indices.category] || 'Uncategorized') : 'Uncategorized',
+        arrayIndex: rowIndex // 0-based; sheet row = rowIndex + 2
       };
     })
     .filter(t => t !== null);
@@ -275,10 +276,20 @@ function _getDaysToPayday() {
 }
 
 /**
- * 3D Matrix Data with Year Awareness
+ * 3D Matrix Data with Year Awareness.
+ * Optional startDate, endDate (YYYY-MM-DD) to filter.
  */
-function _get3DMatrixData() {
-  const txs = _getTransactions(); // Uses cache
+function _get3DMatrixData(startDateStr, endDateStr) {
+  var txs = _getTransactions();
+  if (startDateStr && endDateStr) {
+    var start = new Date(startDateStr);
+    var end = new Date(endDateStr);
+    end.setHours(23, 59, 59);
+    txs = txs.filter(function(t) {
+      var d = new Date(t.date);
+      return d >= start && d <= end;
+    });
+  }
   
   // 1. Aggregate spending by Category
   const categorySpend = {};
@@ -320,10 +331,20 @@ function _get3DMatrixData() {
 }
 
 /**
- * Sankey Diagram with "Other" Grouping for cleaner visuals
+ * Sankey Diagram with "Other" Grouping for cleaner visuals.
+ * Optional startDate, endDate (YYYY-MM-DD) to filter.
  */
-function _getSankeyData() {
-  const txs = _getTransactions();
+function _getSankeyData(startDateStr, endDateStr) {
+  var txs = _getTransactions();
+  if (startDateStr && endDateStr) {
+    var start = new Date(startDateStr);
+    var end = new Date(endDateStr);
+    end.setHours(23, 59, 59);
+    txs = txs.filter(function(t) {
+      var d = new Date(t.date);
+      return d >= start && d <= end;
+    });
+  }
   const MIN_FLOW_VALUE = 50; // Filter out noise transactions < £50
 
   // Income Sources
@@ -373,6 +394,49 @@ function _getSankeyData() {
   });
 
   return { labels, sources, targets, values, colors };
+}
+
+/**
+ * Smart budget suggestions based on last 3 months of spending.
+ */
+function _getSmartBudgetSuggestions() {
+  const txs = _getTransactions();
+  const now = new Date();
+  const threeMonthsAgo = new Date();
+  threeMonthsAgo.setMonth(now.getMonth() - 3);
+
+  const recentExpenses = txs.filter(function(t) {
+    const tDate = new Date(t.date);
+    return tDate >= threeMonthsAgo && tDate <= now && t.amount < 0;
+  });
+
+  const categoryTotals = {};
+  recentExpenses.forEach(function(t) {
+    const cat = t.category || 'Uncategorized';
+    categoryTotals[cat] = (categoryTotals[cat] || 0) + Math.abs(t.amount);
+  });
+
+  const currentMonthSpend = {};
+  txs.filter(function(t) {
+    const tDate = new Date(t.date);
+    return tDate.getMonth() === now.getMonth() && tDate.getFullYear() === now.getFullYear() && t.amount < 0;
+  }).forEach(function(t) {
+    const cat = t.category || 'Uncategorized';
+    currentMonthSpend[cat] = (currentMonthSpend[cat] || 0) + Math.abs(t.amount);
+  });
+
+  return Object.entries(categoryTotals)
+    .sort(function(a, b) { return b[1] - a[1]; })
+    .slice(0, 10)
+    .map(function(entry) {
+      const category = entry[0];
+      const total = entry[1];
+      return {
+        category: category,
+        suggestedLimit: Math.ceil(total / 3),
+        currentMonthSpend: currentMonthSpend[category] || 0
+      };
+    });
 }
 
 /**
@@ -465,7 +529,9 @@ function _saveImportedTransactions(data) {
     sheet.appendRow(['Date', 'Description', 'Amount', 'Category']);
   }
   
-  sheet.getRange(sheet.getLastRow() + 1, 1, newRows.length, 4).setValues(newRows);
+  const startRow = sheet.getLastRow() + 1;
+  const endRow = startRow + newRows.length - 1;
+  sheet.getRange(startRow, 1, endRow, 4).setValues(newRows);
   
   // 4. Clear cache so next fetch includes new data
   _Config.clearCache_();

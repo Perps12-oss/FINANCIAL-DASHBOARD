@@ -62,9 +62,10 @@
   });
 
   function initializeTheme() {
-    const savedTheme = localStorage.getItem('appTheme') || 'dark';
-    document.body.className = `theme-${savedTheme}`;
-    AppState.currentTheme = savedTheme;
+    var saved = localStorage.getItem('appTheme') || '';
+    var themeClass = saved.indexOf('theme-') === 0 ? saved : ('theme-' + (saved || 'dark'));
+    document.body.className = themeClass;
+    AppState.currentTheme = themeClass.replace(/^theme-/, '') || 'dark';
   }
 
   async function initializeApp() {
@@ -1460,6 +1461,8 @@
     reader.readAsText(file);
   }
 
+  var _importCSVData = null;
+
   function processCSV(csvText) {
     const lines = csvText.split('\n').filter(line => line.trim());
     if (lines.length < 2) {
@@ -1472,9 +1475,9 @@
       line.split(',').map(cell => cell.trim())
     );
 
+    _importCSVData = { headers: headers, rows: data };
     showToast(`Loaded ${data.length} rows`, 'success');
     
-    // Show mapping interface
     document.getElementById('import-step-1').style.display = 'none';
     document.getElementById('import-step-2').style.display = 'block';
     
@@ -1502,31 +1505,49 @@
       mapping[select.dataset.field] = select.value;
     });
 
-    const missingFields = Object.entries(mapping)
-      .filter(([_, val]) => !val)
-      .map(([field]) => field);
+    const requiredFields = ['date', 'description', 'amount', 'category'];
+    const missingFields = requiredFields.filter(f => !mapping[f] || mapping[f] === '');
 
     if (missingFields.length > 0) {
-      showError(`Please map all fields: ${missingFields.join(', ')}`);
+      showError(`Please map all required fields: ${missingFields.join(', ')}`);
       return;
     }
+
+    if (!_importCSVData || !_importCSVData.rows || _importCSVData.rows.length === 0) {
+      showError('No import data. Please select a CSV file again.');
+      return;
+    }
+
+    const dateIdx = parseInt(mapping.date, 10);
+    const descIdx = parseInt(mapping.description, 10);
+    const amountIdx = parseInt(mapping.amount, 10);
+    const categoryIdx = mapping.category !== '' ? parseInt(mapping.category, 10) : -1;
+
+    const dataArray = _importCSVData.rows.map(row => {
+      const dateVal = dateIdx >= 0 ? (row[dateIdx] || '').trim() : '';
+      const descVal = descIdx >= 0 ? (row[descIdx] || '').trim() : '';
+      const amtVal = amountIdx >= 0 ? parseFloat(row[amountIdx]) || 0 : 0;
+      const catVal = categoryIdx >= 0 ? (row[categoryIdx] || 'Uncategorized').trim() : 'Uncategorized';
+      return { date: dateVal, description: descVal, amount: amtVal, category: catVal };
+    }).filter(item => item.date && item.description);
 
     showLoader(true);
 
     await safeExecute(async () => {
-      const success = await new Promise((resolve, reject) => {
+      const result = await new Promise((resolve, reject) => {
         google.script.run
           .withSuccessHandler(resolve)
           .withFailureHandler(reject)
-          .processImportData(mapping);
+          .processImportData(dataArray);
       });
 
-      if (success) {
-        showSuccess('Import completed successfully!');
+      if (result && result.success) {
+        showSuccess(`Import completed: ${result.count || 0} transactions added.`);
         closeImportWizard();
+        _importCSVData = null;
         await loadDashboardData(true);
       } else {
-        showError('Import failed');
+        showError(result && result.message ? result.message : 'Import failed');
       }
     }, null, 'Import process failed');
 
@@ -1534,6 +1555,7 @@
   }
 
   function resetImport() {
+    _importCSVData = null;
     document.getElementById('import-step-1').style.display = 'block';
     document.getElementById('import-step-2').style.display = 'none';
     document.getElementById('csv-file').value = '';
@@ -1552,9 +1574,9 @@
   // THEME MANAGEMENT
   // ============================================
   function setTheme(themeName) {
-    const themeClass = themeName ? `theme-${themeName}` : '';
-    document.body.className = themeClass;
-    localStorage.setItem('appTheme', themeClass);
+    const themeClass = themeName ? 'theme-' + themeName : '';
+    document.body.className = themeClass || 'theme-dark';
+    localStorage.setItem('appTheme', themeClass || 'theme-dark');
     
     // Update active swatch
     document.querySelectorAll('.theme-swatch').forEach(s => 
@@ -1845,9 +1867,8 @@
     const startDate = document.getElementById('start-date').value;
     const endDate = document.getElementById('end-date').value;
 
-    // Fetch filtered Sankey data from server
     google.script.run
-      .withSuccessHandler(data => {
+      .withSuccessHandler(function(data) {
         if (!data?.labels?.length) return;
         const trace = {
           type: "sankey",
@@ -1875,12 +1896,11 @@
           font: { color: '#fff' }
         });
       })
-      .withFailureHandler(err => showToast('Failed to load filtered Sankey', 'error'))
-      .fetchSankeyData(startDate, endDate);  // you'll need to modify your server function to accept dates
+      .withFailureHandler(function(err) { showToast('Failed to load filtered Sankey', 'error'); })
+      .fetchSankeyData(startDate, endDate);
 
-    // Similarly, fetch filtered 3D matrix data
     google.script.run
-      .withSuccessHandler(data => {
+      .withSuccessHandler(function(data) {
         if (!data?.x?.length) return;
         const trace = {
           x: data.x,
@@ -1903,8 +1923,8 @@
           }
         });
       })
-      .withFailureHandler(err => showToast('Failed to load filtered 3D data', 'error'))
-      .getMatrixData(startDate, endDate);  // again, modify server function
+      .withFailureHandler(function(err) { showToast('Failed to load filtered 3D data', 'error'); })
+      .getMatrixData(startDate, endDate);
   }
 
   window.clearFilter = function() {

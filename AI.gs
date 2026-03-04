@@ -3,10 +3,14 @@
  * Refactored for robustness and efficiency.
  */
 
+/**
+ * Suggests a category for a transaction via OpenAI API.
+ * Includes retry with exponential backoff for transient failures.
+ */
 function suggestCategory(description) {
   const apiKey = _Config.getUserProp_(_Config.KEYS.OPENAI_API_KEY);
   if (!apiKey) return "Uncategorized (No API Key)";
-  
+
   if (!description || typeof description !== 'string' || description.trim() === '') return "Uncategorized";
 
   const prompt = `Categorize the following financial transaction into exactly one word.
@@ -24,44 +28,70 @@ Category:`;
     max_tokens: 10
   };
 
-  const options = {
-    method: "post",
-    contentType: "application/json",
-    headers: { Authorization: "Bearer " + apiKey },
-    payload: JSON.stringify(payload),
-    muteHttpExceptions: true,
-    timeout: _Config.AI.TIMEOUT_MS || 15000
-  };
+  const maxRetries = 3;
+  let lastError;
 
-  try {
-    const response = UrlFetchApp.fetch(_Config.AI.OPENAI.BASE, options);
-    const responseCode = response.getResponseCode();
-    const json = JSON.parse(response.getContentText());
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      const options = {
+        method: "post",
+        contentType: "application/json",
+        headers: { Authorization: "Bearer " + apiKey },
+        payload: JSON.stringify(payload),
+        muteHttpExceptions: true,
+        timeout: _Config.AI.TIMEOUT_MS || 15000
+      };
 
-    if (responseCode !== 200) {
-      console.error(`OpenAI API Error ${responseCode}`);
-      return "Error (API)";
+      const response = UrlFetchApp.fetch(_Config.AI.OPENAI.BASE, options);
+      const responseCode = response.getResponseCode();
+      const json = JSON.parse(response.getContentText());
+
+      if (responseCode !== 200) {
+        const isRetryable = responseCode >= 500 || responseCode === 429;
+        if (isRetryable && attempt < maxRetries - 1) {
+          Utilities.sleep(Math.pow(2, attempt) * 500);
+          continue;
+        }
+        console.error("OpenAI API Error " + responseCode);
+        return "Error (API)";
+      }
+
+      if (json.choices && json.choices[0] && json.choices[0].message) {
+        let category = json.choices[0].message.content.trim();
+        category = category.replace(/[^\w\s]/g, "");
+        return category.charAt(0).toUpperCase() + category.slice(1).toLowerCase();
+      }
+      return "Uncategorized";
+    } catch (e) {
+      lastError = e;
+      if (attempt < maxRetries - 1) {
+        Utilities.sleep(Math.pow(2, attempt) * 500);
+      }
     }
-
-    if (json.choices && json.choices[0] && json.choices[0].message) {
-      let category = json.choices[0].message.content.trim();
-      category = category.replace(/[^\w\s]/g, ''); // Remove punctuation
-      return category.charAt(0).toUpperCase() + category.slice(1).toLowerCase();
-    }
-    return "Uncategorized";
-  } catch (e) {
-    console.error('AI Suggestion System Error:', e);
-    return "Error (System)";
   }
+
+  console.error("AI Suggestion System Error:", lastError);
+  return "Error (System)";
 }
 
+/**
+ * Batch categorizes uncategorized transactions using AI.
+ * Uses a single setValues() call instead of N setValue() calls.
+ */
 function batchCategorizeTransactions() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const sheet = ss.getActiveSheet();
+  const sheet = ss.getSheetByName(_Config.RUNTIME.TRANSACTION_SHEET_NAME);
+  if (!sheet) {
+    SpreadsheetApp.getUi().alert("Transaction sheet not found.");
+    return 0;
+  }
+
   const rawData = _getCoreTransactionData();
   const txs = _parseTransactions(rawData);
-  const uncategorized = txs.filter(t => !t.category || t.category === '' || t.category === 'Uncategorized' || t.category.includes('Error'));
-  
+  const uncategorized = txs.filter(function(t) {
+    return !t.category || t.category === "" || t.category === "Uncategorized" || t.category.indexOf("Error") >= 0;
+  });
+
   if (uncategorized.length === 0) return 0;
 
   const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
@@ -69,23 +99,41 @@ function batchCategorizeTransactions() {
   if (categoryColIndex === 0) return 0;
 
   const apiKey = _Config.getUserProp_(_Config.KEYS.OPENAI_API_KEY);
-  if (!apiKey) { SpreadsheetApp.getUi().alert("API Key missing."); return 0; }
-
-  let categorized = 0;
-  if (uncategorized.length > 50) {
-    const ui = SpreadsheetApp.getUi();
-    if (ui.alert(`Process ${uncategorized.length} transactions?`, "This incurs costs.", ui.ButtonSet.YES_NO) !== ui.Button.YES) return 0;
+  if (!apiKey) {
+    SpreadsheetApp.getUi().alert("API Key missing.");
+    return 0;
   }
 
-  uncategorized.forEach((tx, index) => {
-    if (index > 0) Utilities.sleep(200);
-    const suggestion = suggestCategory(tx.description);
-    if (suggestion && !suggestion.includes('Error')) {
-      const row = tx.rowIndex || (tx.arrayIndex + 2);
-      sheet.getRange(row, categoryColIndex).setValue(suggestion);
-      categorized++;
+  if (uncategorized.length > 50) {
+    const ui = SpreadsheetApp.getUi();
+    if (ui.alert("Process " + uncategorized.length + " transactions?", "This incurs costs.", ui.ButtonSet.YES_NO) !== ui.Button.YES) return 0;
+  }
+
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) return 0;
+
+  var categoryRange = sheet.getRange(2, categoryColIndex, lastRow, categoryColIndex);
+  var values = categoryRange.getValues();
+
+  var categorized = 0;
+  for (var i = 0; i < uncategorized.length; i++) {
+    if (i > 0) Utilities.sleep(200);
+    var tx = uncategorized[i];
+    var suggestion = suggestCategory(tx.description);
+    if (suggestion && suggestion.indexOf("Error") < 0) {
+      var arrIdx = tx.arrayIndex;
+      if (arrIdx >= 0 && arrIdx < values.length) {
+        values[arrIdx][0] = suggestion;
+        categorized++;
+      }
     }
-  });
+  }
+
+  if (categorized > 0) {
+    categoryRange.setValues(values);
+  }
+
+  _Config.clearCache_();
   return categorized;
 }
 

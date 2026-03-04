@@ -5,8 +5,7 @@
 
 function getDashboardData() {
   try {
-    const rawData = _getCoreTransactionData();
-    const parsed = _parseTransactions(rawData);
+    const parsed = _getTransactions();
     const settings = JSON.parse(_Config.getUserProp_(_Config.KEYS.SETTINGS_PROP_KEY) || '{"source":"active"}');
     const budgets = JSON.parse(_Config.getUserProp_(_Config.KEYS.BUDGETS_PROP_KEY) || '{}');
     const nw = JSON.parse(_Config.getUserProp_(_Config.KEYS.NET_WORTH_KEY) || '{"assets":[], "liabilities":[]}');
@@ -26,18 +25,18 @@ function getDashboardData() {
   }
 }
 
-function getMatrixData() {
+function getMatrixData(startDate, endDate) {
   try {
-    return _get3DMatrixData();
+    return _get3DMatrixData(startDate || null, endDate || null);
   } catch (e) {
     console.error('getMatrixData error:', e);
     return { x: [], y: [], z: [] };
   }
 }
 
-function fetchSankeyData() {
+function fetchSankeyData(startDate, endDate) {
   try {
-    return _getSankeyData();
+    return _getSankeyData(startDate || null, endDate || null);
   } catch (e) {
     console.error('fetchSankeyData error:', e);
     return { labels: [], sources: [], targets: [], values: [], colors: [] };
@@ -141,14 +140,27 @@ function getAISuggestion(description) {
   }
 }
 
+function setUserProp(key, value) {
+  try {
+    if (!key || typeof key !== 'string') {
+      return { status: 'error', message: 'Invalid key' };
+    }
+    _Config.setUserProp_(key, value);
+    return { status: 'success' };
+  } catch (e) {
+    return { status: 'error', message: e.message };
+  }
+}
+
 function _logSystem(level, message, source) {
   try {
-    const ss = SpreadsheetApp.getActiveSpreadsheet();
-    const logSheet = ss.getSheetByName('_SystemLog');
+    Logger.log(level + ': ' + message + ' (' + (source || 'API') + ')');
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var logSheet = ss.getSheetByName('_SystemLog');
     if (logSheet) {
       logSheet.appendRow([new Date(), level, message, source || 'API']);
     }
   } catch (e) {
-    // Silent fail for logging
+    Logger.log('Log failed: ' + e.message);
   }
 }

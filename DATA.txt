@@ -158,15 +158,26 @@ function _parseDate_(dateInput) {
 }
 
 /**
+ * Fast hex encoding for MD5 digest (avoids per-byte string ops in hot path)
+ */
+function _toHex_(bytes) {
+  var hex = '0123456789abcdef';
+  var out = '';
+  for (var i = 0; i < bytes.length; i++) {
+    var b = bytes[i] & 0xFF;
+    out += hex[(b >> 4) & 0xF] + hex[b & 0xF];
+  }
+  return out;
+}
+
+/**
  * Parses raw sheet data into structured objects with hashed IDs
  */
 function _parseTransactions(rows) {
   if (!rows || rows.length < 2) return [];
-  
-  const headers = rows[0].map(h => h.toString().toLowerCase().trim());
-  const requiredHeaders = ['date', 'description', 'amount'];
-  
-  const indices = {
+
+  var headers = rows[0].map(function(h) { return h.toString().toLowerCase().trim(); });
+  var indices = {
     date: headers.indexOf('date'),
     description: headers.indexOf('description'),
     amount: headers.indexOf('amount'),
@@ -177,22 +188,21 @@ function _parseTransactions(rows) {
     console.error('Missing critical headers (Date, Description, or Amount)');
     return [];
   }
-  
+
   return rows.slice(1)
-    .map((row, rowIndex) => {
-      const dateVal = _parseDate_(row[indices.date]);
-      const desc = row[indices.description];
-      const amt = parseFloat(row[indices.amount]) || 0;
+    .map(function(row, rowIndex) {
+      var dateVal = _parseDate_(row[indices.date]);
+      var desc = row[indices.description];
+      var amt = parseFloat(row[indices.amount]) || 0;
 
-      if (!dateVal || !desc) return null; // Skip invalid rows silently
+      if (!dateVal || !desc) return null;
 
-      const dateISO = dateVal.toISOString().split('T')[0];
-      
-      // Create a unique hash for duplicate detection
-      const hash = Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, 
-        `${dateISO}-${desc}-${amt}`, 
+      var dateISO = dateVal.toISOString().split('T')[0];
+      var hashBytes = Utilities.computeDigest(Utilities.DigestAlgorithm.MD5,
+        dateISO + '-' + desc + '-' + amt,
         Utilities.Charset.UTF_8
-      ).map(b => ('0' + (b & 0xFF).toString(16)).slice(-2)).join('');
+      );
+      var hash = _toHex_(hashBytes);
 
       return {
         id: hash,
@@ -201,10 +211,10 @@ function _parseTransactions(rows) {
         description: desc.toString().trim(),
         amount: amt,
         category: indices.category !== -1 ? (row[indices.category] || 'Uncategorized') : 'Uncategorized',
-        arrayIndex: rowIndex // 0-based; sheet row = rowIndex + 2
+        arrayIndex: rowIndex
       };
     })
-    .filter(t => t !== null);
+    .filter(function(t) { return t !== null; });
 }
 
 /**
@@ -489,12 +499,12 @@ function _saveImportedTransactions(data) {
 
   // 2. Filter new data
   const newRows = [];
-  data.forEach(item => {
-    // Generate hash for incoming item
-    const hash = Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, 
-      `${item.date}-${item.description}-${item.amount}`, 
+  data.forEach(function(item) {
+    var hashBytes = Utilities.computeDigest(Utilities.DigestAlgorithm.MD5,
+      item.date + '-' + item.description + '-' + item.amount,
       Utilities.Charset.UTF_8
-    ).map(b => ('0' + (b & 0xFF).toString(16)).slice(-2)).join('');
+    );
+    var hash = _toHex_(hashBytes);
 
     if (!existingIds.has(hash)) {
       newRows.push([

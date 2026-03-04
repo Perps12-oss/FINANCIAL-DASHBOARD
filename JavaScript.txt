@@ -196,13 +196,19 @@
   // ============================================
   // DATA LOADING WITH CACHE & RETRY
   // ============================================
-  async function loadDashboardData(forceRefresh = false) {
-    const cacheKey = 'dashboardData';
-    const cacheTime = 5 * 60 * 1000; // 5 minutes
-    
-    // Check cache
+  function invalidateDataSnapshot() {
+    try {
+      sessionStorage.removeItem('dashboardData');
+    } catch (e) {}
+  }
+
+  async function loadDashboardData(forceRefresh) {
+    if (typeof forceRefresh === 'undefined') forceRefresh = false;
+    var cacheKey = 'dashboardData';
+    var cacheTime = 5 * 60 * 1000;
+
     if (!forceRefresh) {
-      const cached = sessionStorage.getItem(cacheKey);
+      var cached = sessionStorage.getItem(cacheKey);
       if (cached) {
         try {
           const { data, timestamp } = JSON.parse(cached);
@@ -1430,11 +1436,13 @@
   }
 
   // ============================================
-  // IMPORT WIZARD
+  // IMPORT WIZARD (Scan Architecture)
   // ============================================
+  var _importCSVData = null;
+
   function handleDrop(e) {
     preventDefaults(e);
-    const file = e.dataTransfer?.files[0];
+    var file = e.dataTransfer && e.dataTransfer.files[0];
     if (file && file.type === 'text/csv') {
       handleFileSelect({ target: { files: [file] } });
     } else {
@@ -1443,17 +1451,17 @@
   }
 
   function handleFileSelect(event) {
-    const file = event.target.files?.[0];
+    var file = event.target && event.target.files && event.target.files[0];
     if (!file) return;
 
-    if (file.type !== 'text/csv' && !file.name.endsWith('.csv')) {
+    if (file.type !== 'text/csv' && file.name.indexOf('.csv') === -1) {
       showError('Please select a CSV file');
       return;
     }
 
-    const reader = new FileReader();
+    var reader = new FileReader();
     reader.onload = function(e) {
-      processCSV(e.target.result);
+      scanAndParseCSV(e.target.result);
     };
     reader.onerror = function() {
       showError('Failed to read file');
@@ -1461,42 +1469,55 @@
     reader.readAsText(file);
   }
 
-  var _importCSVData = null;
+  function scanAndParseCSV(csvText) {
+    var result = parseCSVToStructuredData(csvText);
+    if (!result) return;
 
-  function processCSV(csvText) {
-    const lines = csvText.split('\n').filter(line => line.trim());
+    _importCSVData = result;
+    showToast('Loaded ' + result.rows.length + ' rows', 'success');
+    showImportStep('mapping');
+    renderMappingStep(result.headers);
+  }
+
+  function parseCSVToStructuredData(csvText) {
+    var lines = csvText.split('\n').filter(function(l) { return l.trim(); });
     if (lines.length < 2) {
       showError('CSV must have headers and at least one data row');
-      return;
+      return null;
     }
+    var headers = lines[0].split(',').map(function(h) { return h.trim(); });
+    var rows = lines.slice(1).map(function(line) {
+      return line.split(',').map(function(cell) { return cell.trim(); });
+    });
+    return { headers: headers, rows: rows };
+  }
 
-    const headers = lines[0].split(',').map(h => h.trim());
-    const data = lines.slice(1).map(line => 
-      line.split(',').map(cell => cell.trim())
-    );
+  function showImportStep(step) {
+    var step1 = document.getElementById('import-step-1');
+    var step2 = document.getElementById('import-step-2');
+    if (step === 'mapping') {
+      if (step1) step1.style.display = 'none';
+      if (step2) step2.style.display = 'block';
+    } else {
+      if (step1) step1.style.display = 'block';
+      if (step2) step2.style.display = 'none';
+    }
+  }
 
-    _importCSVData = { headers: headers, rows: data };
-    showToast(`Loaded ${data.length} rows`, 'success');
-    
-    document.getElementById('import-step-1').style.display = 'none';
-    document.getElementById('import-step-2').style.display = 'block';
-    
-    generateMappingUI(headers);
+  function renderMappingStep(headers) {
+    var mappingArea = document.getElementById('mapping-area');
+    if (!mappingArea) return;
+
+    var requiredFields = ['Date', 'Description', 'Amount', 'Category'];
+    mappingArea.innerHTML = requiredFields.map(function(field) {
+      return '<div class="mapping-row"><label>' + field + ':</label><select class="map-select" data-field="' + field.toLowerCase() + '"><option value="">-- Select Column --</option>' + headers.map(function(h, i) {
+        return '<option value="' + i + '">' + escapeHtml(h) + '</option>';
+      }).join('') + '</select></div>';
+    }).join('');
   }
 
   function generateMappingUI(headers) {
-    const mappingArea = document.getElementById('mapping-area');
-    const requiredFields = ['Date', 'Description', 'Amount', 'Category'];
-
-    mappingArea.innerHTML = requiredFields.map(field => `
-      <div class="mapping-row">
-        <label>${field}:</label>
-        <select class="map-select" data-field="${field.toLowerCase()}">
-          <option value="">-- Select Column --</option>
-          ${headers.map((h, i) => `<option value="${i}">${h}</option>`).join('')}
-        </select>
-      </div>
-    `).join('');
+    renderMappingStep(headers);
   }
 
   async function executeImport() {
@@ -1542,7 +1563,8 @@
       });
 
       if (result && result.success) {
-        showSuccess(`Import completed: ${result.count || 0} transactions added.`);
+        invalidateDataSnapshot();
+        showSuccess('Import completed: ' + (result.count || 0) + ' transactions added.');
         closeImportWizard();
         _importCSVData = null;
         await loadDashboardData(true);
@@ -1984,31 +2006,24 @@
     showLoader(true);
     
     try {
-      // Force refresh data using existing function (it returns a promise-like)
-      await new Promise((resolve, reject) => {
+      var data = await new Promise(function(resolve, reject) {
         google.script.run
           .withSuccessHandler(resolve)
           .withFailureHandler(reject)
-          .getDashboardData(); // This should return the full data object
-      }).then(data => {
-        // Update AppState and UI
-        AppState.update('data', data);
-        updateKPIs(data.kpis);
-        renderDashboardCharts();
-        initializeCalendar();  // re-creates calendar with new data
-        initializeNetWorth();
-        
-        // Update last sync time
-        lastSyncTime = new Date().toLocaleString();
-        localStorage.setItem('lastSyncTime', lastSyncTime);
-        
-        // Refresh budget view if visible
-        if (document.getElementById('budgets-view')?.style.display === 'block') {
-          loadSmartSuggestions();
-        }
-        
-        showToast('Dashboard synced successfully!', 'success');
+          .getDashboardData();
       });
+      invalidateDataSnapshot();
+      AppState.update('data', data);
+      updateKPIs(data.kpis);
+      renderDashboardCharts();
+      initializeCalendar();
+      initializeNetWorth();
+      lastSyncTime = new Date().toLocaleString();
+      localStorage.setItem('lastSyncTime', lastSyncTime);
+      if (document.getElementById('budgets-view') && document.getElementById('budgets-view').style.display === 'block') {
+        loadSmartSuggestions();
+      }
+      showToast('Dashboard synced successfully!', 'success');
     } catch (error) {
       showError('Sync failed: ' + error.message);
     } finally {

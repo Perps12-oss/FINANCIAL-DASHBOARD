@@ -1,0 +1,18 @@
+# Conventional Commits - Financial Dashboard
+# <type>: <short description>
+#
+# Types: feat | fix | ui | perf | docs | refactor | chore
+#
+# feat: new feature
+# fix: bug fix
+# ui: UI/layout changes
+# perf: performance improvement
+# docs: documentation
+# refactor: code restructure without behavior change
+# chore: maintenance
+#
+# Example:
+# feat: add CSV import wizard
+# fix: resolve snapshot update issue
+# ui: overhaul review page layout
+# perf: optimize hashing pipeline

@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <meta charset="utf-8">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+  <script src="https://cdn.plot.ly/plotly-2.24.1.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/countup.js@2.6.2/dist/countUp.umd.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/fullcalendar@6.1.8/index.global.min.js"></script>
+  <?!= include('Styles'); ?>
+</head>
+<body>
+  <div id="app-container">
+    <!-- Navigation Rail -->
+    <nav class="nav-rail">
+      <div class="nav-item" onclick="showPage('dashboard')"><i class="fas fa-chart-pie"></i><span>Dashboard</span></div>
+      <div class="nav-item" onclick="showPage('calendar')"><i class="fas fa-calendar-alt"></i><span>Calendar</span></div>
+      <div class="nav-item" onclick="showPage('budgets')"><i class="fas fa-wallet"></i><span>Budgets</span></div>
+      <div class="nav-item" onclick="showPage('forecast')"><i class="fas fa-chart-line"></i><span>Forecast</span></div>
+      <div class="nav-item" onclick="showPage('networth')"><i class="fas fa-landmark"></i><span>Net Worth</span></div>
+      <div class="nav-item" onclick="showPage('settings')"><i class="fas fa-cog"></i><span>Settings</span></div>
+      <div class="nav-item import-btn" onclick="openImportWizard()"><i class="fas fa-file-import"></i><span>Import</span></div>
+    </nav>
+
+    <!-- Main Content -->
+    <main class="content">
+      <!-- KPI Header -->
+      <header class="kpi-header">
+        <div class="kpi-card glass" onclick="openKpiDetail('balance')"><h3>Balance</h3><div class="kpi-val" id="kpi-balance">£0</div></div>
+        <div class="kpi-card glass" onclick="openKpiDetail('income')"><h3>Income</h3><div class="kpi-val" id="kpi-income">£0</div></div>
+        <div class="kpi-card glass" onclick="openKpiDetail('expenses')"><h3>Expense</h3><div class="kpi-val" id="kpi-expense">£0</div></div>
+        <div class="kpi-card glass" onclick="openKpiDetail('savings')"><h3>Savings</h3><div class="kpi-val" id="kpi-savings">0%</div></div>
+      </header>
+
+      <section id="page-content">
+        <div id="loader" class="loader-container" style="display: none;"><div class="spinner"></div><p>Loading data...</p></div>
+
+        <!-- Dashboard -->
+        <div id="dashboard-view" class="grid-container">
+          <div class="chart-card glass"><h3>Cash Flow Sankey</h3><div id="chart-sankey" class="chart-box"></div></div>
+          <div class="chart-card glass"><h3>3D Spending</h3><div id="chart-3d" class="chart-box"></div></div>
+          <div class="chart-card glass full-width"><h3>Running Balance</h3><div id="chart-running-balance" class="chart-box"></div></div>
+        </div>
+
+        <!-- Calendar -->
+        <div id="calendar-view" style="display: none;"><div class="glass calendar-container"><div id="calendar"></div></div></div>
+
+        <!-- Budgets -->
+        <div id="budgets-view" style="display: none;">
+          <div class="glass" style="padding: 20px; margin-bottom: 20px; display: flex; justify-content: space-between; align-items: center;">
+            <h2><i class="fas fa-wallet"></i> Smart Budgeting</h2>
+            <button class="btn-primary" onclick="loadSmartSuggestions()"><i class="fas fa-wand-magic"></i> Generate Budget</button>
+          </div>
+          <div id="budget-list" class="budget-grid"></div>
+          <div style="text-align: center; padding: 20px;"><button class="btn-primary" onclick="saveAllBudgets()"><i class="fas fa-save"></i> Save Plan</button></div>
+        </div>
+
+        <!-- Forecast (Updated IDs and removed inline oninput) -->
+        <div id="forecast-view" style="display: none;">
+          <div style="display: grid; grid-template-columns: 300px 1fr; gap: 20px;">
+            <div class="glass" style="padding: 20px;">
+              <h3>Scenario Planner</h3>
+              <div style="margin: 20px 0;">
+                <label>Income Change</label>
+                <input type="range" id="income-slider" min="-2000" max="5000" value="0" step="100" style="width: 100%">
+                <span id="income-val">£0</span>
+              </div>
+              <div style="margin: 20px 0;">
+                <label>Expense Change</label>
+                <input type="range" id="expense-slider" min="-2000" max="2000" value="0" step="100" style="width: 100%">
+                <span id="expense-val">£0</span>
+              </div>
+              <button class="btn-primary" onclick="runForecast()">Run Forecast</button>
+            </div>
+            <div class="chart-card glass"><div id="chart-forecast" class="chart-box"></div></div>
+          </div>
+        </div>
+
+        <!-- Net Worth (Added Save Button) -->
+        <div id="networth-view" style="display: none;">
+          <div class="glass" style="padding: 40px; text-align: center; margin-bottom: 20px;">
+            <h2>Total Net Worth</h2>
+            <div class="kpi-val" style="font-size: 48px;" id="nw-total">£0</div>
+          </div>
+          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
+            <div class="glass" style="padding: 20px;">
+              <h3>Assets</h3>
+              <div id="asset-list"></div>
+              <button class="btn-outline" onclick="addAssetRow('assets')">Add Asset</button>
+            </div>
+            <div class="glass" style="padding: 20px;">
+              <h3>Liabilities</h3>
+              <div id="liab-list"></div>
+              <button class="btn-outline" onclick="addAssetRow('liabilities')">Add Liability</button>
+            </div>
+          </div>
+          <div style="text-align: center; padding: 20px;">
+            <button class="btn-primary" onclick="syncNetWorth()"><i class="fas fa-sync"></i> Sync Net Worth</button>
+          </div>
+        </div>
+
+        <!-- Settings (Added Data Source Configuration) -->
+        <div id="settings-view" style="display: none;">
+          <div class="settings-container glass">
+            <h2><i class="fas fa-palette"></i> Appearance</h2>
+            <div class="settings-group">
+              <label>Select Theme</label>
+              <div class="theme-picker-grid">
+                <div class="theme-swatch" data-theme="neon" style="background: linear-gradient(45deg, #0f0c29, #302b63);" onclick="setTheme('neon')" title="Neon"></div>
+                <div class="theme-swatch" data-theme="ocean" style="background: linear-gradient(45deg, #141E30, #006994);" onclick="setTheme('ocean')" title="Ocean"></div>
+                <div class="theme-swatch" data-theme="forest" style="background: linear-gradient(45deg, #0f2027, #2c5364);" onclick="setTheme('forest')" title="Forest"></div>
+                <div class="theme-swatch" data-theme="sunset" style="background: linear-gradient(45deg, #352f44, #fa7a52);" onclick="setTheme('sunset')" title="Sunset"></div>
+                <div class="theme-swatch" data-theme="mono" style="background: linear-gradient(45deg, #000000, #434343);" onclick="setTheme('mono')" title="Mono"></div>
+                <div class="theme-swatch" data-theme="toxic" style="background: linear-gradient(45deg, #0a2a0a, #39ff14);" onclick="setTheme('toxic')" title="Toxic"></div>
+                <div class="theme-swatch" data-theme="candy" style="background: linear-gradient(45deg, #ff9a9e, #fad0c4);" onclick="setTheme('candy')" title="Candy"></div>
+                <div class="theme-swatch" data-theme="gold" style="background: linear-gradient(45deg, #000000, #d4af37);" onclick="setTheme('gold')" title="Gold"></div>
+                <div class="theme-swatch" data-theme="arctic" style="background: linear-gradient(45deg, #E0EAFC, #00c6ff);" onclick="setTheme('arctic')" title="Arctic"></div>
+                <div class="theme-swatch" data-theme="lava" style="background: linear-gradient(45deg, #200122, #fc4a1a);" onclick="setTheme('lava')" title="Lava"></div>
+              </div>
+            </div>
+
+            <h2 style="margin-top: 30px;"><i class="fas fa-database"></i> Data Source</h2>
+            <div class="settings-group">
+              <label>Source Type</label>
+              <select id="source-type" onchange="toggleExternalInput()">
+                <option value="active">Current (Bound) Sheet</option>
+                <option value="external">External Google Sheet</option>
+              </select>
+            </div>
+            <div id="external-id-container" style="display: none; margin-top: 15px;">
+              <label>Google Sheet ID</label>
+              <input type="text" id="external-sheet-id" placeholder="Paste Sheet ID from URL" style="width: 100%; padding: 10px; border-radius: 8px; border: 1px solid var(--glass-border); background: rgba(0,0,0,0.2); color: white;">
+              <p style="font-size: 12px; color: var(--text-dim); margin-top: 5px;">Example: 1BxiMVs0XRA5nFMdKvBdBZjgmUUqptvpND0nLJje7pxA</p>
+              <button class="btn-outline" style="margin-top: 10px;" onclick="verifyConnection()"><i class="fas fa-plug"></i> Test Connection</button>
+            </div>
+
+            <div class="settings-group" style="margin-top: 20px;">
+              <label>OpenAI API Key (Optional)</label>
+              <input type="password" id="openai-key" placeholder="sk-..." style="width: 100%; padding: 10px; border-radius: 8px; border: 1px solid var(--glass-border); background: rgba(0,0,0,0.2); color: white;">
+            </div>
+
+            <button class="btn-primary" style="margin-top: 30px;" onclick="saveAllSettings()"><i class="fas fa-save"></i> Save Configuration</button>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- FLOATING ACTION BUTTON -->
+  <div class="fab-container">
+    <div class="fab-options">
+      <button class="fab-option" onclick="openImportWizard()" title="Import CSV"><i class="fas fa-file-upload"></i></button>
+      <button class="fab-option" onclick="showToast('Manual entry coming soon', 'info')" title="Add Manual"><i class="fas fa-pen"></i></button>
+    </div>
+    <button class="fab-main" onclick="toggleFab(this)"><i class="fas fa-plus"></i></button>
+  </div>
+
+  <!-- TINY MODAL (Calendar) -->
+  <div id="tiny-modal" class="tiny-modal">
+    <div class="tiny-modal-header">
+      <span id="tiny-modal-title">Transactions</span>
+      <span class="tiny-modal-close" onclick="closeTinyModal()">✕</span>
+    </div>
+    <div id="tiny-modal-body"></div>
+  </div>
+
+  <!-- KPI DETAIL MODAL -->
+  <div id="kpi-detail-modal" class="modal">
+    <div class="modal-content glass" style="max-width: 800px;">
+      <div style="display: flex; justify-content: space-between; margin-bottom: 20px;">
+        <h2 id="detail-title">Detailed View</h2>
+        <span class="close" onclick="closeModal('kpi-detail-modal')">&times;</span>
+      </div>
+      <div id="kpi-detail-body"></div>
+    </div>
+  </div>
+
+  <!-- IMPORT MODAL -->
+  <div id="import-modal" class="modal">
+    <div class="modal-content glass">
+      <div style="display: flex; justify-content: space-between; margin-bottom: 20px;">
+        <h2>Import Data</h2><span class="close" onclick="closeImportWizard()">&times;</span>
+      </div>
+      <div id="import-step-1">
+        <div class="drop-zone" id="drop-zone" style="padding: 40px; text-align: center; border: 2px dashed var(--glass-border); border-radius: 12px; cursor: pointer;">
+          <i class="fas fa-cloud-upload-alt fa-3x" style="color: var(--primary)"></i>
+          <p>Click to Upload CSV</p>
+          <input type="file" id="csv-file" accept=".csv" hidden>
+        </div>
+      </div>
+      <div id="import-step-2" style="display: none;">
+        <div id="mapping-area"></div>
+        <button class="btn-primary" onclick="executeImport()">Import</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- TOAST CONTAINER -->
+  <div id="toast-container" class="toast-container"></div>
+
+  <?!= include('JavaScript'); ?>
+</body>
+</html>

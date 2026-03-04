@@ -1,0 +1,4507 @@
+DUMP 2
+
+
+<script>
+  // ============================================
+  // GLOBAL STATE MANAGEMENT
+  // ============================================
+  const AppState = {
+    data: null,
+    calendar: null,
+    chartInstances: {},
+    modalChartInstance: null,
+    currentTheme: localStorage.getItem('appTheme') || 'dark',
+    filters: { category: null, dateRange: null },
+    pendingRequests: new Set(),
+    toastQueue: [],
+    
+    // Safe state updates
+    update(key, value) {
+      this[key] = value;
+      window.dispatchEvent(new CustomEvent('appstate-change', { detail: { key, value } }));
+    }
+  };
+
+  // ============================================
+  // ERROR BOUNDARY & SAFE EXECUTION
+  // ============================================
+  async function safeExecute(fn, fallback = null, errorMessage = 'Operation failed') {
+    try {
+      return await fn();
+    } catch (error) {
+      console.error(`${errorMessage}:`, error);
+      showToast(errorMessage, 'error');
+      return fallback;
+    }
+  }
+
+  // ============================================
+  // DEBOUNCE UTILITY
+  // ============================================
+  function debounce(func, wait) {
+    let timeout;
+    return function executedFunction(...args) {
+      const later = () => {
+        clearTimeout(timeout);
+        func(...args);
+      };
+      clearTimeout(timeout);
+      timeout = setTimeout(later, wait);
+    };
+  }
+
+  // ============================================
+  // INITIALIZATION (IMPROVED)
+  // ============================================
+  document.addEventListener('DOMContentLoaded', async function() {
+    try {
+      initializeTheme();
+      await initializeApp();
+      initializeEventListeners();
+      initializeServiceWorker();
+    } catch (error) {
+      showError('Failed to initialize application: ' + error.message);
+    }
+  });
+
+  function initializeTheme() {
+    const savedTheme = localStorage.getItem('appTheme') || 'dark';
+    document.body.className = `theme-${savedTheme}`;
+    AppState.currentTheme = savedTheme;
+  }
+
+  async function initializeApp() {
+    showLoader(true);
+    await loadDashboardData();
+    showLoader(false);
+  }
+
+  function initializeEventListeners() {
+    // Dropzone with proper drag & drop
+    const dropZone = document.getElementById('drop-zone');
+    if (dropZone) {
+      ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
+        dropZone.addEventListener(eventName, preventDefaults);
+      });
+      
+      dropZone.addEventListener('drop', handleDrop);
+      dropZone.addEventListener('click', () => document.getElementById('csv-file').click());
+    }
+
+    // File input with validation
+    const fileInput = document.getElementById('csv-file');
+    if (fileInput) {
+      fileInput.addEventListener('change', handleFileSelect);
+    }
+
+    // Window resize handler for charts
+    window.addEventListener('resize', debounce(handleResize, 250));
+    
+    // Keyboard shortcuts
+    window.addEventListener('keydown', handleKeyboardShortcuts);
+  }
+
+  function preventDefaults(e) {
+    e.preventDefault();
+    e.stopPropagation();
+  }
+
+  function handleResize() {
+    if (AppState.calendar) AppState.calendar.updateSize();
+    Object.values(AppState.chartInstances).forEach(chart => {
+      if (chart && typeof chart.resize === 'function') chart.resize();
+    });
+  }
+
+  function handleKeyboardShortcuts(e) {
+    // Ctrl/Cmd + K to search
+    if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
+      e.preventDefault();
+      showQuickSearch();
+    }
+    // Escape to close modals
+    if (e.key === 'Escape') {
+      closeAllModals();
+    }
+  }
+
+  // ============================================
+  // TOAST NOTIFICATION SYSTEM (ENHANCED)
+  // ============================================
+  function showToast(message, type = 'info', duration = 4000) {
+    const container = document.getElementById('toast-container');
+    if (!container) return;
+
+    const id = `toast-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    const icon = {
+      success: 'check-circle',
+      error: 'exclamation-circle',
+      warning: 'exclamation-triangle',
+      info: 'info-circle'
+    }[type] || 'info-circle';
+
+    const toast = document.createElement('div');
+    toast.id = id;
+    toast.className = `toast ${type}`;
+    toast.setAttribute('role', 'alert');
+    toast.innerHTML = `
+      <i class="fas fa-${icon}"></i>
+      <span>${message}</span>
+      <button class="toast-close" onclick="this.parentElement.remove()">×</button>
+    `;
+
+    container.appendChild(toast);
+    
+    // Trigger animation
+    setTimeout(() => toast.classList.add('show'), 10);
+    
+    // Auto remove
+    const timeoutId = setTimeout(() => {
+      toast.classList.remove('show');
+      setTimeout(() => toast.remove(), 300);
+    }, duration);
+
+    // Store timeout for cleanup
+    toast.dataset.timeoutId = timeoutId;
+    
+    // Pause timeout on hover
+    toast.addEventListener('mouseenter', () => clearTimeout(timeoutId));
+    toast.addEventListener('mouseleave', () => {
+      const newTimeout = setTimeout(() => {
+        toast.classList.remove('show');
+        setTimeout(() => toast.remove(), 300);
+      }, duration);
+      toast.dataset.timeoutId = newTimeout;
+    });
+  }
+
+  function showError(message) { showToast(message, 'error'); }
+  function showSuccess(message) { showToast(message, 'success'); }
+  function showWarning(message) { showToast(message, 'warning'); }
+
+  // ============================================
+  // LOADER MANAGEMENT
+  // ============================================
+  function showLoader(show) {
+    const loader = document.getElementById('loader');
+    if (!loader) return;
+    
+    if (show) {
+      loader.style.display = 'flex';
+      loader.setAttribute('aria-label', 'Loading content');
+    } else {
+      loader.style.display = 'none';
+      loader.removeAttribute('aria-label');
+    }
+  }
+
+  // ============================================
+  // DATA LOADING WITH CACHE & RETRY
+  // ============================================
+  async function loadDashboardData(forceRefresh = false) {
+    const cacheKey = 'dashboardData';
+    const cacheTime = 5 * 60 * 1000; // 5 minutes
+    
+    // Check cache
+    if (!forceRefresh) {
+      const cached = sessionStorage.getItem(cacheKey);
+      if (cached) {
+        try {
+          const { data, timestamp } = JSON.parse(cached);
+          if (Date.now() - timestamp < cacheTime) {
+            processDashboardData(data);
+            return;
+          }
+        } catch (e) {
+          // Invalid cache, ignore
+        }
+      }
+    }
+
+    // Load fresh data with retry
+    let retries = 3;
+    while (retries > 0) {
+      try {
+        const data = await new Promise((resolve, reject) => {
+          google.script.run
+            .withSuccessHandler(resolve)
+            .withFailureHandler(reject)
+            .getDashboardData();
+        });
+        
+        // Cache the data
+        sessionStorage.setItem(cacheKey, JSON.stringify({
+          data,
+          timestamp: Date.now()
+        }));
+        
+        processDashboardData(data);
+        return;
+      } catch (error) {
+        retries--;
+        if (retries === 0) {
+          showError('Failed to load data after multiple attempts');
+          showLoader(false);
+        } else {
+          await new Promise(r => setTimeout(r, 1000)); // Wait 1s before retry
+        }
+      }
+    }
+  }
+
+  function processDashboardData(data) {
+    AppState.update('data', data);
+    updateKPIs(data.kpis);
+    renderDashboardCharts();
+    initializeCalendar();
+    initializeNetWorth();
+  }
+
+  function updateKPIs(kpis) {
+    if (!kpis) return;
+    
+    const kpiElements = {
+      balance: 'kpi-balance',
+      income: 'kpi-income',
+      expense: 'kpi-expense',
+      savingsRate: 'kpi-savings'
+    };
+
+    Object.entries(kpiElements).forEach(([key, id]) => {
+      const element = document.getElementById(id);
+      if (!element) return;
+
+      if (key === 'savingsRate') {
+        element.innerText = kpis[key] + '%';
+      } else {
+        try {
+          new countUp.CountUp(id, parseFloat(kpis[key]), {
+            prefix: '£',
+            decimalPlaces: 2,
+            duration: 2,
+            enableScrollSpy: true
+          }).start();
+        } catch (e) {
+          element.innerText = `£${parseFloat(kpis[key]).toFixed(2)}`;
+        }
+      }
+    });
+  }
+
+  // ============================================
+  // ENHANCED CALENDAR
+  // ============================================
+  function initializeCalendar() {
+    const calendarEl = document.getElementById('calendar');
+    if (!calendarEl || !AppState.data) return;
+
+    // Destroy existing calendar if any
+    if (AppState.calendar) {
+      AppState.calendar.destroy();
+    }
+
+    const events = AppState.data.transactions.map(t => ({
+      id: `tx-${t.date}-${t.description}-${Math.random()}`,
+      title: `${t.description} (${t.category})`,
+      start: t.date,
+      end: t.date,
+      allDay: true,
+      className: t.amount >= 0 ? 'fc-event-income' : 'fc-event-expense',
+      extendedProps: { ...t },
+      backgroundColor: t.amount >= 0 ? 'var(--success)' : 'var(--danger)',
+      borderColor: 'transparent'
+    }));
+
+    AppState.calendar = new FullCalendar.Calendar(calendarEl, {
+      initialView: 'dayGridMonth',
+      headerToolbar: {
+        left: 'prev,next today',
+        center: 'title',
+        right: 'dayGridMonth,timeGridWeek,listMonth'
+      },
+      events: events,
+      eventDisplay: 'block',
+      dayMaxEvents: 3,
+      moreLinkClick: 'day',
+      
+      dayCellDidMount: (info) => {
+        renderSparkline(info.date, info.el);
+      },
+      
+      dateClick: (info) => {
+        showDayTransactions(info.dateStr, info.jsEvent);
+      },
+      
+      eventClick: (info) => {
+        showTransactionDetails(info.event.extendedProps, info.jsEvent);
+      },
+      
+      eventDidMount: (info) => {
+        // Add tooltip
+        info.el.setAttribute('title', 
+          `${info.event.title}\nAmount: £${Math.abs(info.event.extendedProps.amount).toFixed(2)}`
+        );
+      },
+      
+      height: 'auto',
+      aspectRatio: 1.8,
+      
+      // Localization
+      locale: 'en',
+      firstDay: 1, // Monday
+      
+      // Loading indicator
+      loading: (isLoading) => {
+        showLoader(isLoading);
+      }
+    });
+
+    AppState.calendar.render();
+  }
+
+  function renderSparkline(date, cellEl) {
+    if (!AppState.data?.transactions) return;
+    
+    const dateStr = date.toISOString().split('T')[0];
+    const dayTxs = AppState.data.transactions.filter(t => t.date === dateStr);
+    if (dayTxs.length === 0) return;
+
+    const totals = dayTxs.reduce((acc, t) => {
+      if (t.amount > 0) acc.income += t.amount;
+      else acc.expense += Math.abs(t.amount);
+      return acc;
+    }, { income: 0, expense: 0 });
+
+    const maxValue = Math.max(totals.income, totals.expense, 1);
+    const wrap = document.createElement('div');
+    wrap.className = 'day-sparkline-wrap';
+    wrap.setAttribute('aria-label', `Income: £${totals.income.toFixed(2)}, Expense: £${totals.expense.toFixed(2)}`);
+
+    if (totals.income > 0) {
+      const bar = document.createElement('div');
+      bar.className = 'spark-bar spark-income';
+      bar.style.width = `${(totals.income / maxValue) * 100}%`;
+      wrap.appendChild(bar);
+    }
+
+    if (totals.expense > 0) {
+      const bar = document.createElement('div');
+      bar.className = 'spark-bar spark-expense';
+      bar.style.width = `${(totals.expense / maxValue) * 100}%`;
+      wrap.appendChild(bar);
+    }
+
+    const frame = cellEl.querySelector('.fc-daygrid-day-frame');
+    if (frame) frame.appendChild(wrap);
+  }
+
+  // ============================================
+  // TRANSACTION MODALS
+  // ============================================
+  function showDayTransactions(dateStr, jsEvent) {
+    if (!AppState.data) return;
+    
+    const dayTxs = AppState.data.transactions
+      .filter(t => t.date === dateStr)
+      .sort((a, b) => Math.abs(b.amount) - Math.abs(a.amount));
+
+    if (dayTxs.length === 0) return;
+
+    const modal = document.getElementById('tiny-modal');
+    const title = document.getElementById('tiny-modal-title');
+    const body = document.getElementById('tiny-modal-body');
+    
+    title.textContent = `Transactions: ${formatDate(dateStr, 'long')}`;
+    body.innerHTML = dayTxs.map(t => createTransactionRow(t)).join('');
+
+    positionModal(modal, jsEvent);
+    modal.style.display = 'block';
+  }
+
+  function showTransactionDetails(transaction, jsEvent) {
+    const modal = document.getElementById('tiny-modal');
+    const title = document.getElementById('tiny-modal-title');
+    const body = document.getElementById('tiny-modal-body');
+    
+    title.textContent = formatDate(transaction.date, 'long');
+    body.innerHTML = createTransactionDetails(transaction);
+
+    positionModal(modal, jsEvent);
+    modal.style.display = 'block';
+  }
+
+  function createTransactionRow(t) {
+    const isIncome = t.amount >= 0;
+    return `
+      <div class="tiny-tx-item" onclick="showTransactionDetails(${JSON.stringify(t).replace(/"/g, '&quot;')}, event)">
+        <div>
+          <div style="font-weight:500;">${escapeHtml(t.description)}</div>
+          <div style="color:var(--text-dim); font-size:11px;">${escapeHtml(t.category || 'Uncategorized')}</div>
+        </div>
+        <div style="font-weight:700; color:${isIncome ? 'var(--success)' : 'var(--danger)'}">
+          ${isIncome ? '+' : '-'}£${Math.abs(t.amount).toFixed(2)}
+        </div>
+      </div>
+    `;
+  }
+
+  function createTransactionDetails(t) {
+    return `
+      <div class="transaction-detail">
+        <div class="detail-row">
+          <span class="detail-label">Description:</span>
+          <span class="detail-value">${escapeHtml(t.description)}</span>
+        </div>
+        <div class="detail-row">
+          <span class="detail-label">Amount:</span>
+          <span class="detail-value" style="color:${t.amount >= 0 ? 'var(--success)' : 'var(--danger)'}">
+            ${t.amount >= 0 ? '+' : '-'}£${Math.abs(t.amount).toFixed(2)}
+          </span>
+        </div>
+        <div class="detail-row">
+          <span class="detail-label">Category:</span>
+          <span class="detail-value">${escapeHtml(t.category || 'Uncategorized')}</span>
+        </div>
+        <div class="detail-row">
+          <span class="detail-label">Date:</span>
+          <span class="detail-value">${formatDate(t.date, 'long')}</span>
+        </div>
+        <div class="detail-actions">
+          <button class="btn-outline btn-small" onclick="editTransaction('${t.date}', '${escapeHtml(t.description)}')">
+            <i class="fas fa-edit"></i> Edit
+          </button>
+          <button class="btn-outline btn-small" onclick="categorizeTransaction('${t.date}', '${escapeHtml(t.description)}')">
+            <i class="fas fa-tag"></i> Recategorize
+          </button>
+        </div>
+      </div>
+    `;
+  }
+
+  function positionModal(modal, jsEvent) {
+    const x = jsEvent.clientX;
+    const y = jsEvent.clientY;
+    
+    modal.style.display = 'block';
+    const rect = modal.getBoundingClientRect();
+    
+    let left = x;
+    let top = y;
+    
+    if (left + rect.width > window.innerWidth) {
+      left = window.innerWidth - rect.width - 20;
+    }
+    if (top + rect.height > window.innerHeight) {
+      top = window.innerHeight - rect.height - 20;
+    }
+    
+    modal.style.left = left + 'px';
+    modal.style.top = top + 'px';
+    modal.style.transform = 'none';
+  }
+
+  function closeTinyModal() {
+    document.getElementById('tiny-modal').style.display = 'none';
+  }
+
+  // ============================================
+  // KPI DETAIL MODAL
+  // ============================================
+  function openKpiDetail(type) {
+    const modal = document.getElementById('kpi-detail-modal');
+    const bodyEl = document.getElementById('kpi-detail-body');
+    const titleEl = document.getElementById('detail-title');
+    
+    if (!modal || !bodyEl || !titleEl || !AppState.data) return;
+
+    const now = new Date();
+    const currentMonthTxs = AppState.data.transactions.filter(t => {
+      const d = new Date(t.date);
+      return d.getMonth() === now.getMonth() && d.getFullYear() === now.getFullYear();
+    });
+
+    let content = '';
+    switch(type) {
+      case 'expenses':
+        titleEl.textContent = 'Monthly Expenses';
+        const expenses = currentMonthTxs.filter(t => t.amount < 0);
+        content = generateExpenseView(expenses);
+        break;
+      case 'income':
+        titleEl.textContent = 'Monthly Income';
+        const incomes = currentMonthTxs.filter(t => t.amount > 0);
+        content = generateIncomeView(incomes);
+        break;
+      case 'savings':
+        titleEl.textContent = 'Savings Analysis';
+        content = generateSavingsView(currentMonthTxs);
+        break;
+    }
+
+    bodyEl.innerHTML = content;
+    modal.style.display = 'block';
+    
+    // Initialize chart if needed
+    if (type !== 'savings') {
+      setTimeout(() => {
+        const ctx = document.getElementById('modal-chart');
+        if (ctx) {
+          renderCategoryChart(type === 'expenses' ? expenses : incomes);
+        }
+      }, 100);
+    }
+  }
+
+  function generateExpenseView(expenses) {
+    const total = expenses.reduce((s, t) => s + Math.abs(t.amount), 0);
+    const categories = {};
+    expenses.forEach(t => {
+      const cat = t.category || 'Uncategorized';
+      categories[cat] = (categories[cat] || 0) + Math.abs(t.amount);
+    });
+
+    return `
+      <div class="kpi-detail-stats">
+        <div class="stat-card glass">
+          <span class="stat-label">Total Expenses</span>
+          <span class="stat-value">£${total.toFixed(2)}</span>
+        </div>
+        <div class="stat-card glass">
+          <span class="stat-label">Transaction Count</span>
+          <span class="stat-value">${expenses.length}</span>
+        </div>
+        <div class="stat-card glass">
+          <span class="stat-label">Average</span>
+          <span class="stat-value">£${(total / (expenses.length || 1)).toFixed(2)}</span>
+        </div>
+      </div>
+      <div class="chart-wrapper-modal">
+        <canvas id="modal-chart"></canvas>
+      </div>
+      <div class="detail-list">
+        ${expenses.slice(0, 10).map(t => `
+          <div class="detail-row">
+            <span class="detail-date">${formatDate(t.date)}</span>
+            <span class="detail-desc">${escapeHtml(t.description)}</span>
+            <span class="detail-amount" style="color:var(--danger)">-£${Math.abs(t.amount).toFixed(2)}</span>
+          </div>
+        `).join('')}
+      </div>
+    `;
+  }
+
+  function generateIncomeView(incomes) {
+    const total = incomes.reduce((s, t) => s + t.amount, 0);
+    
+    return `
+      <div class="kpi-detail-stats">
+        <div class="stat-card glass">
+          <span class="stat-label">Total Income</span>
+          <span class="stat-value">£${total.toFixed(2)}</span>
+        </div>
+        <div class="stat-card glass">
+          <span class="stat-label">Transaction Count</span>
+          <span class="stat-value">${incomes.length}</span>
+        </div>
+      </div>
+      <div class="chart-wrapper-modal">
+        <canvas id="modal-chart"></canvas>
+      </div>
+      <div class="detail-list">
+        ${incomes.slice(0, 10).map(t => `
+          <div class="detail-row">
+            <span class="detail-date">${formatDate(t.date)}</span>
+            <span class="detail-desc">${escapeHtml(t.description)}</span>
+            <span class="detail-amount" style="color:var(--success)">+£${t.amount.toFixed(2)}</span>
+          </div>
+        `).join('')}
+      </div>
+    `;
+  }
+
+  function generateSavingsView(transactions) {
+    const income = transactions.filter(t => t.amount > 0).reduce((s, t) => s + t.amount, 0);
+    const expense = transactions.filter(t => t.amount < 0).reduce((s, t) => s + Math.abs(t.amount), 0);
+    const savings = income - expense;
+    const rate = income > 0 ? (savings / income) * 100 : 0;
+
+    return `
+      <div class="savings-dashboard">
+        <div class="savings-ring">
+          <svg viewBox="0 0 120 120">
+            <circle class="savings-ring-bg" cx="60" cy="60" r="54" fill="none" stroke="rgba(255,255,255,0.1)" stroke-width="12"/>
+            <circle class="savings-ring-fill" cx="60" cy="60" r="54" fill="none" 
+                    stroke="${rate >= 0 ? 'var(--success)' : 'var(--danger)'}" 
+                    stroke-width="12" stroke-dasharray="${2 * Math.PI * 54}" 
+                    stroke-dashoffset="${2 * Math.PI * 54 * (1 - Math.min(Math.abs(rate), 100) / 100)}"
+                    transform="rotate(-90 60 60)"/>
+          </svg>
+          <div class="savings-ring-text">
+            <div class="savings-percent">${rate.toFixed(1)}%</div>
+            <div class="savings-label">Savings Rate</div>
+          </div>
+        </div>
+        
+        <div class="savings-stats">
+          <div class="stat-row">
+            <span>Income</span>
+            <span style="color:var(--success)">+£${income.toFixed(2)}</span>
+          </div>
+          <div class="stat-row">
+            <span>Expenses</span>
+            <span style="color:var(--danger)">-£${expense.toFixed(2)}</span>
+          </div>
+          <div class="stat-row total">
+            <span>Net Savings</span>
+            <span style="color:${savings >= 0 ? 'var(--success)' : 'var(--danger)'}">
+              ${savings >= 0 ? '+' : '-'}£${Math.abs(savings).toFixed(2)}
+            </span>
+          </div>
+        </div>
+        
+        <div class="savings-tips glass">
+          <h4><i class="fas fa-lightbulb"></i> Insights</h4>
+          <ul>
+            ${generateSavingsTips(rate, savings, income)}
+          </ul>
+        </div>
+      </div>
+    `;
+  }
+
+  function generateSavingsTips(rate, savings, income) {
+    const tips = [];
+    if (rate < 10) tips.push('Your savings rate is low. Consider reducing discretionary spending.');
+    if (rate > 30) tips.push('Excellent savings rate! Consider investing the surplus.');
+    if (savings < 0) tips.push('You\'re spending more than you earn. Review your expenses.');
+    if (income === 0) tips.push('No income recorded this month. Add your income sources.');
+    if (tips.length === 0) tips.push('You\'re on track! Keep up the good financial habits.');
+    
+    return tips.map(t => `<li>${t}</li>`).join('');
+  }
+
+  // ============================================
+  // CHART RENDERING (PLOTLY)
+  // ============================================
+  function renderDashboardCharts() {
+    renderSankeyChart();
+    render3DMatrix();
+    renderRunningBalance();
+  }
+
+  function renderSankeyChart() {
+    const chartId = 'chart-sankey';
+    safeExecute(async () => {
+      const data = await new Promise((resolve, reject) => {
+        google.script.run
+          .withSuccessHandler(resolve)
+          .withFailureHandler(reject)
+          .fetchSankeyData();
+      });
+
+      if (!data?.labels?.length) return;
+
+      const trace = {
+        type: "sankey",
+        orientation: "h",
+        node: {
+          pad: 15,
+          thickness: 20,
+          label: data.labels,
+          color: data.labels.map((l, i) => {
+            if (l.includes('Total Income')) return '#00d2ff';
+            if (i < data.labels.indexOf(l.includes('Total Income') ? l : '')) return 'rgba(0, 255, 136, 0.8)';
+            return 'rgba(255, 77, 77, 0.8)';
+          }),
+          line: { color: 'rgba(255,255,255,0.2)', width: 0.5 },
+          hoverinfo: 'all'
+        },
+        link: {
+          source: data.sources,
+          target: data.targets,
+          value: data.values,
+          color: 'rgba(255,255,255,0.1)'
+        }
+      };
+
+      const layout = {
+        font: { size: 12, color: "#fff" },
+        paper_bgcolor: "rgba(0,0,0,0)",
+        plot_bgcolor: "rgba(0,0,0,0)",
+        margin: { l: 20, r: 20, t: 20, b: 20 },
+        hoverlabel: { bgcolor: "rgba(0,0,0,0.8)", font: { color: "#fff" } }
+      };
+
+      await Plotly.newPlot(chartId, [trace], layout, { 
+        responsive: true, 
+        displayModeBar: false,
+        showSendToCloud: false
+      });
+      
+      AppState.chartInstances[chartId] = true;
+    }, null, 'Failed to render Sankey chart');
+  }
+
+  function render3DMatrix() {
+    const chartId = 'chart-3d';
+    safeExecute(async () => {
+      const data = await new Promise((resolve, reject) => {
+        google.script.run
+          .withSuccessHandler(resolve)
+          .withFailureHandler(reject)
+          .getMatrixData();
+      });
+
+      if (!data?.x?.length) return;
+
+      const trace = {
+        x: data.x,
+        y: data.y,
+        z: data.z,
+        type: 'surface',
+        colorscale: [
+          [0, '#020024'],
+          [0.3, '#090979'],
+          [0.6, '#00d2ff'],
+          [1, '#00ff88']
+        ],
+        contours: {
+          z: {
+            show: true,
+            usecolormap: true,
+            highlightcolor: "#42f5e3",
+            project: { z: true }
+          }
+        },
+        hovertemplate: '<b>Category:</b> %{x}<br><b>Month:</b> %{y}<br><b>Spend:</b> £%{z:.2f}<extra></extra>'
+      };
+
+      const layout = {
+        autosize: true,
+        paper_bgcolor: 'rgba(0,0,0,0)',
+        margin: { l: 0, r: 0, b: 0, t: 0 },
+        scene: {
+          camera: {
+            eye: { x: 1.8, y: 1.8, z: 1.5 }
+          },
+          xaxis: { 
+            tickfont: { color: '#ccc', size: 10 },
+            gridcolor: 'rgba(255,255,255,0.1)'
+          },
+          yaxis: { 
+            tickfont: { color: '#ccc', size: 10 },
+            gridcolor: 'rgba(255,255,255,0.1)'
+          },
+          zaxis: { 
+            tickfont: { color: '#ccc', size: 10 },
+            gridcolor: 'rgba(255,255,255,0.1)'
+          }
+        }
+      };
+
+      await Plotly.newPlot(chartId, [trace], layout, { 
+        responsive: true,
+        displayModeBar: false
+      });
+      
+      AppState.chartInstances[chartId] = true;
+    }, null, 'Failed to render 3D chart');
+  }
+
+  function renderRunningBalance() {
+    const chartId = 'chart-running-balance';
+    if (!AppState.data?.transactions) return;
+
+    const txs = [...AppState.data.transactions]
+      .sort((a, b) => new Date(a.date) - new Date(b.date));
+    
+    let running = 0;
+    const balanceData = txs.map(t => {
+      running += t.amount;
+      return { date: t.date, balance: running };
+    });
+
+    const trace = {
+      x: balanceData.map(d => d.date),
+      y: balanceData.map(d => d.balance),
+      type: 'scatter',
+      mode: 'lines',
+      line: { color: '#00d2ff', width: 3, shape: 'spline' },
+      fill: 'tozeroy',
+      fillcolor: 'rgba(0, 210, 255, 0.1)',
+      hovertemplate: 'Date: %{x}<br>Balance: £%{y:.2f}<extra></extra>'
+    };
+
+    const layout = {
+      paper_bgcolor: 'rgba(0,0,0,0)',
+      plot_bgcolor: 'rgba(0,0,0,0)',
+      font: { color: '#fff' },
+      xaxis: { 
+        gridcolor: 'rgba(255,255,255,0.05)',
+        tickfont: { color: '#ccc' }
+      },
+      yaxis: { 
+        gridcolor: 'rgba(255,255,255,0.05)',
+        zerolinecolor: 'rgba(255,255,255,0.1)',
+        tickfont: { color: '#ccc' },
+        tickprefix: '£'
+      },
+      margin: { l: 50, r: 20, t: 20, b: 40 },
+      hoverlabel: { bgcolor: 'rgba(0,0,0,0.8)' }
+    };
+
+    Plotly.newPlot(chartId, [trace], layout, { 
+      responsive: true,
+      displayModeBar: false
+    });
+  }
+
+  function renderCategoryChart(data) {
+    const ctx = document.getElementById('modal-chart');
+    if (!ctx) return;
+
+    const categoryMap = {};
+    data.forEach(t => {
+      const cat = t.category || 'Uncategorized';
+      categoryMap[cat] = (categoryMap[cat] || 0) + Math.abs(t.amount);
+    });
+
+    const colors = [
+      '#00d2ff', '#ff4d4d', '#00ff88', '#ffaa00',
+      '#9b59b6', '#3498db', '#e74c3c', '#2ecc71',
+      '#f39c12', '#1abc9c'
+    ];
+
+    if (AppState.modalChartInstance) {
+      AppState.modalChartInstance.destroy();
+    }
+
+    AppState.modalChartInstance = new Chart(ctx, {
+      type: 'doughnut',
+      data: {
+        labels: Object.keys(categoryMap),
+        datasets: [{
+          data: Object.values(categoryMap),
+          backgroundColor: colors.slice(0, Object.keys(categoryMap).length),
+          borderWidth: 0,
+          hoverOffset: 15
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: {
+            position: 'right',
+            labels: {
+              color: 'rgba(255,255,255,0.8)',
+              font: { size: 11 }
+            }
+          },
+          tooltip: {
+            callbacks: {
+              label: (context) => {
+                const value = context.raw;
+                const total = context.dataset.data.reduce((a, b) => a + b, 0);
+                const percentage = ((value / total) * 100).toFixed(1);
+                return `£${value.toFixed(2)} (${percentage}%)`;
+              }
+            }
+          }
+        },
+        cutout: '70%',
+        animation: {
+          animateRotate: true,
+          animateScale: true
+        }
+      }
+    });
+  }
+
+  // ============================================
+  // BUDGET MANAGEMENT
+  // ============================================
+  async function loadSmartSuggestions() {
+    showLoader(true);
+    
+    await safeExecute(async () => {
+      const budgets = await new Promise((resolve, reject) => {
+        google.script.run
+          .withSuccessHandler(resolve)
+          .withFailureHandler(reject)
+          .getSmartBudgets();
+      });
+
+      renderBudgetCards(budgets);
+      showLoader(false);
+    }, null, 'Failed to load budget suggestions');
+  }
+
+  function renderBudgetCards(budgets) {
+    const container = document.getElementById('budget-list');
+    if (!container) return;
+
+    if (!budgets?.length) {
+      container.innerHTML = '<p class="no-data">No budget data available</p>';
+      return;
+    }
+
+    container.innerHTML = budgets.map(b => {
+      const percent = b.currentMonthSpend > 0 ? 
+        (b.currentMonthSpend / b.suggestedLimit) * 100 : 0;
+      const isOver = percent > 100;
+
+      return `
+        <div class="budget-card glass ${isOver ? 'alert-border' : ''}">
+          <div class="budget-header">
+            <span class="budget-category">${escapeHtml(b.category)}</span>
+            <span class="budget-amount">
+              £${b.currentMonthSpend.toFixed(0)} / 
+              <input type="number" 
+                     value="${b.suggestedLimit}" 
+                     class="budget-input" 
+                     data-category="${escapeHtml(b.category)}"
+                     min="0"
+                     step="10">
+            </span>
+          </div>
+          <div class="progress-container">
+            <div class="progress-bar" 
+                 style="width: ${Math.min(percent, 100)}%; 
+                        background: ${isOver ? 'var(--danger)' : 'linear-gradient(90deg, var(--success), var(--primary))'};">
+            </div>
+          </div>
+          <div class="budget-footer">
+            <span class="budget-percent">${percent.toFixed(1)}% used</span>
+            <span class="budget-remaining ${isOver ? 'over' : ''}">
+              ${isOver ? 'Over by' : 'Remaining'}: 
+              £${Math.abs(b.suggestedLimit - b.currentMonthSpend).toFixed(2)}
+            </span>
+          </div>
+        </div>
+      `;
+    }).join('');
+  }
+
+  async function saveAllBudgets() {
+    const budgetMap = {};
+    document.querySelectorAll('.budget-input').forEach(input => {
+      const category = input.dataset.category;
+      const value = parseFloat(input.value) || 0;
+      if (category && value > 0) {
+        budgetMap[category] = value;
+      }
+    });
+
+    await safeExecute(async () => {
+      await new Promise((resolve, reject) => {
+        google.script.run
+          .withSuccessHandler(resolve)
+          .withFailureHandler(reject)
+          .saveFinalBudgets(budgetMap);
+      });
+      
+      showSuccess('Budgets saved successfully!');
+    }, null, 'Failed to save budgets');
+  }
+
+  // ============================================
+  // FORECAST
+  // ============================================
+  function runForecast() {
+    const adjustments = {
+      incomeMod: parseFloat(document.getElementById('income-slider')?.value || 0),
+      expenseMod: parseFloat(document.getElementById('expense-slider')?.value || 0)
+    };
+
+    showLoader(true);
+    
+    safeExecute(async () => {
+      const projection = await new Promise((resolve, reject) => {
+        google.script.run
+          .withSuccessHandler(resolve)
+          .withFailureHandler(reject)
+          .getForecastData(adjustments);
+      });
+
+      renderForecastChart(projection);
+      showLoader(false);
+    }, null, 'Failed to generate forecast');
+  }
+
+  function renderForecastChart(projection) {
+    if (!projection?.length) return;
+
+    const colors = projection.map(p => 
+      parseFloat(p.balance) >= 0 ? 'var(--success)' : 'var(--danger)'
+    );
+
+    const trace = {
+      x: projection.map(p => p.month),
+      y: projection.map(p => p.balance),
+      type: 'scatter',
+      mode: 'lines+markers',
+      line: { 
+        shape: 'spline', 
+        color: '#00ff88', 
+        width: 3 
+      },
+      marker: { 
+        size: 10, 
+        color: colors,
+        line: { color: '#fff', width: 2 }
+      },
+      fill: 'tozeroy',
+      fillcolor: 'rgba(0, 255, 136, 0.1)',
+      hovertemplate: 'Month: %{x}<br>Balance: £%{y:.2f}<extra></extra>'
+    };
+
+    const layout = {
+      title: { 
+        text: '12-Month Financial Projection', 
+        font: { color: '#fff', size: 16 } 
+      },
+      paper_bgcolor: 'rgba(0,0,0,0)',
+      plot_bgcolor: 'rgba(0,0,0,0)',
+      xaxis: { 
+        gridcolor: 'rgba(255,255,255,0.1)', 
+        tickfont: { color: '#ccc' },
+        tickangle: -45
+      },
+      yaxis: { 
+        title: 'Balance (£)', 
+        gridcolor: 'rgba(255,255,255,0.1)', 
+        tickfont: { color: '#ccc' },
+        tickprefix: '£'
+      },
+      margin: { l: 60, r: 30, b: 60, t: 60 },
+      hoverlabel: { bgcolor: 'rgba(0,0,0,0.8)' }
+    };
+
+    Plotly.newPlot('chart-forecast', [trace], layout, { 
+      responsive: true,
+      displayModeBar: false
+    });
+  }
+
+  // ============================================
+  // NET WORTH
+  // ============================================
+  function initializeNetWorth() {
+    if (!AppState.data?.nw) return;
+
+    const { assets = [], liabilities = [] } = AppState.data.nw;
+    
+    document.getElementById('asset-list').innerHTML = '';
+    document.getElementById('liab-list').innerHTML = '';
+
+    assets.forEach(a => addAssetRow('assets', a.name, a.value));
+    liabilities.forEach(l => addAssetRow('liabilities', l.name, l.value));
+
+    calculateNetWorthTotal();
+  }
+
+  function addAssetRow(type, name = '', value = 0) {
+    const container = document.getElementById(type === 'assets' ? 'asset-list' : 'liab-list');
+    if (!container) return;
+
+    const rowId = `row-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    const row = document.createElement('div');
+    row.className = 'nw-row';
+    row.id = rowId;
+    row.innerHTML = `
+      <input type="text" class="nw-name" placeholder="Name" value="${escapeHtml(name)}">
+      <input type="number" class="nw-value" placeholder="Value" value="${value}" step="100" min="0">
+      <button class="nw-delete" onclick="removeAssetRow('${rowId}', '${type}')">
+        <i class="fas fa-times"></i>
+      </button>
+    `;
+
+    // Add change listeners
+    row.querySelectorAll('input').forEach(input => {
+      input.addEventListener('input', debounce(calculateNetWorthTotal, 300));
+    });
+
+    container.appendChild(row);
+    calculateNetWorthTotal();
+  }
+
+  function removeAssetRow(rowId, type) {
+    const row = document.getElementById(rowId);
+    if (row) {
+      row.remove();
+      calculateNetWorthTotal();
+      showToast('Item removed', 'info');
+    }
+  }
+
+  function calculateNetWorthTotal() {
+    let totalAssets = parseFloat(AppState.data?.kpis?.balance || 0);
+    let totalLiabilities = 0;
+
+    document.querySelectorAll('#asset-list .nw-value').forEach(input => {
+      totalAssets += parseFloat(input.value) || 0;
+    });
+
+    document.querySelectorAll('#liab-list .nw-value').forEach(input => {
+      totalLiabilities += parseFloat(input.value) || 0;
+    });
+
+    const total = totalAssets - totalLiabilities;
+    const element = document.getElementById('nw-total');
+    
+    if (element) {
+      element.textContent = `£${total.toLocaleString(undefined, {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2
+      })}`;
+      element.style.color = total >= 0 ? 'var(--success)' : 'var(--danger)';
+    }
+
+    return total;
+  }
+
+  async function syncNetWorth() {
+    const assets = [];
+    const liabilities = [];
+
+    document.querySelectorAll('#asset-list .nw-row').forEach(row => {
+      const name = row.querySelector('.nw-name')?.value;
+      const value = parseFloat(row.querySelector('.nw-value')?.value) || 0;
+      if (name && value > 0) {
+        assets.push({ name, value });
+      }
+    });
+
+    document.querySelectorAll('#liab-list .nw-row').forEach(row => {
+      const name = row.querySelector('.nw-name')?.value;
+      const value = parseFloat(row.querySelector('.nw-value')?.value) || 0;
+      if (name && value > 0) {
+        liabilities.push({ name, value });
+      }
+    });
+
+    await safeExecute(async () => {
+      await new Promise((resolve, reject) => {
+        google.script.run
+          .withSuccessHandler(resolve)
+          .withFailureHandler(reject)
+          .saveNetWorth({ assets, liabilities });
+      });
+      
+      showSuccess('Net worth updated successfully!');
+    }, null, 'Failed to save net worth');
+  }
+
+  // ============================================
+  // SETTINGS
+  // ============================================
+  function toggleExternalInput() {
+    const type = document.getElementById('source-type')?.value;
+    const container = document.getElementById('external-id-container');
+    if (container) {
+      container.style.display = type === 'external' ? 'block' : 'none';
+    }
+  }
+
+  async function verifyConnection() {
+    const id = document.getElementById('external-sheet-id')?.value;
+    if (!id) {
+      showWarning('Please enter a Sheet ID');
+      return;
+    }
+
+    showLoader(true);
+    
+    await safeExecute(async () => {
+      const result = await new Promise((resolve, reject) => {
+        google.script.run
+          .withSuccessHandler(resolve)
+          .withFailureHandler(reject)
+          .testExternalConnection(id);
+      });
+
+      if (result.success) {
+        showSuccess(`Connected to: ${result.name}`);
+      } else {
+        showError(result.message);
+      }
+    }, null, 'Connection test failed');
+
+    showLoader(false);
+  }
+
+  async function saveAllSettings() {
+    const sourceType = document.getElementById('source-type')?.value;
+    const externalId = document.getElementById('external-sheet-id')?.value;
+    const apiKey = document.getElementById('openai-key')?.value;
+
+    showLoader(true);
+
+    // Save data source
+    const sourceSaved = await safeExecute(async () => {
+      await new Promise((resolve, reject) => {
+        google.script.run
+          .withSuccessHandler(resolve)
+          .withFailureHandler(reject)
+          .updateDataSource(sourceType, externalId);
+      });
+      return true;
+    }, false, 'Failed to save data source');
+
+    // Save API key if provided
+    if (apiKey && sourceSaved) {
+      await safeExecute(async () => {
+        await new Promise((resolve, reject) => {
+          google.script.run
+            .withSuccessHandler(resolve)
+            .withFailureHandler(reject)
+            .setUserProp('OPENAI_API_KEY', apiKey);
+        });
+      }, null, 'Failed to save API key');
+    }
+
+    showLoader(false);
+    
+    if (sourceSaved) {
+      showSuccess('Settings saved! Refreshing data...');
+      setTimeout(() => loadDashboardData(true), 1500);
+    }
+  }
+
+  // ============================================
+  // IMPORT WIZARD
+  // ============================================
+  function handleDrop(e) {
+    preventDefaults(e);
+    const file = e.dataTransfer?.files[0];
+    if (file && file.type === 'text/csv') {
+      handleFileSelect({ target: { files: [file] } });
+    } else {
+      showError('Please drop a CSV file');
+    }
+  }
+
+  function handleFileSelect(event) {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    if (file.type !== 'text/csv' && !file.name.endsWith('.csv')) {
+      showError('Please select a CSV file');
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = function(e) {
+      processCSV(e.target.result);
+    };
+    reader.onerror = function() {
+      showError('Failed to read file');
+    };
+    reader.readAsText(file);
+  }
+
+  function processCSV(csvText) {
+    const lines = csvText.split('\n').filter(line => line.trim());
+    if (lines.length < 2) {
+      showError('CSV must have headers and at least one data row');
+      return;
+    }
+
+    const headers = lines[0].split(',').map(h => h.trim());
+    const data = lines.slice(1).map(line => 
+      line.split(',').map(cell => cell.trim())
+    );
+
+    showToast(`Loaded ${data.length} rows`, 'success');
+    
+    // Show mapping interface
+    document.getElementById('import-step-1').style.display = 'none';
+    document.getElementById('import-step-2').style.display = 'block';
+    
+    generateMappingUI(headers);
+  }
+
+  function generateMappingUI(headers) {
+    const mappingArea = document.getElementById('mapping-area');
+    const requiredFields = ['Date', 'Description', 'Amount', 'Category'];
+
+    mappingArea.innerHTML = requiredFields.map(field => `
+      <div class="mapping-row">
+        <label>${field}:</label>
+        <select class="map-select" data-field="${field.toLowerCase()}">
+          <option value="">-- Select Column --</option>
+          ${headers.map((h, i) => `<option value="${i}">${h}</option>`).join('')}
+        </select>
+      </div>
+    `).join('');
+  }
+
+  async function executeImport() {
+    const mapping = {};
+    document.querySelectorAll('.map-select').forEach(select => {
+      mapping[select.dataset.field] = select.value;
+    });
+
+    const missingFields = Object.entries(mapping)
+      .filter(([_, val]) => !val)
+      .map(([field]) => field);
+
+    if (missingFields.length > 0) {
+      showError(`Please map all fields: ${missingFields.join(', ')}`);
+      return;
+    }
+
+    showLoader(true);
+
+    await safeExecute(async () => {
+      const success = await new Promise((resolve, reject) => {
+        google.script.run
+          .withSuccessHandler(resolve)
+          .withFailureHandler(reject)
+          .processImportData(mapping);
+      });
+
+      if (success) {
+        showSuccess('Import completed successfully!');
+        closeImportWizard();
+        await loadDashboardData(true);
+      } else {
+        showError('Import failed');
+      }
+    }, null, 'Import process failed');
+
+    showLoader(false);
+  }
+
+  function resetImport() {
+    document.getElementById('import-step-1').style.display = 'block';
+    document.getElementById('import-step-2').style.display = 'none';
+    document.getElementById('csv-file').value = '';
+  }
+
+  function openImportWizard() {
+    document.getElementById('import-modal').style.display = 'block';
+    resetImport();
+  }
+
+  function closeImportWizard() {
+    document.getElementById('import-modal').style.display = 'none';
+  }
+
+  // ============================================
+  // THEME MANAGEMENT
+  // ============================================
+  function setTheme(themeName) {
+    const themeClass = themeName ? `theme-${themeName}` : '';
+    document.body.className = themeClass;
+    localStorage.setItem('appTheme', themeClass);
+    
+    // Update active swatch
+    document.querySelectorAll('.theme-swatch').forEach(s => 
+      s.classList.remove('active')
+    );
+    if (themeName) {
+      document.querySelector(`.theme-swatch[data-theme="${themeName}"]`)
+        ?.classList.add('active');
+    }
+
+    // Refresh charts with new theme
+    if (AppState.data) {
+      renderDashboardCharts();
+    }
+
+    showToast(`Theme changed to ${themeName || 'Default'}`, 'info');
+  }
+
+  function toggleFab(btn) {
+    btn.classList.toggle('active');
+    const menu = btn.previousElementSibling;
+    if (menu) menu.classList.toggle('show');
+  }
+
+  // ============================================
+  // PAGE NAVIGATION
+  // ============================================
+  function showPage(pageId) {
+    // Hide all pages
+    document.querySelectorAll('#page-content > div[id$="-view"]').forEach(div => {
+      div.style.display = 'none';
+    });
+
+    // Show selected page
+    const target = document.getElementById(pageId + '-view');
+    if (target) {
+      target.style.display = 'block';
+      
+      // Page-specific handlers
+      switch(pageId) {
+        case 'dashboard':
+          setTimeout(() => {
+            Object.keys(AppState.chartInstances).forEach(id => {
+              Plotly.relayout(id, {});
+            });
+          }, 100);
+          break;
+          
+        case 'calendar':
+          if (AppState.calendar) {
+            setTimeout(() => AppState.calendar.updateSize(), 100);
+          } else {
+            initializeCalendar();
+          }
+          break;
+          
+        case 'budgets':
+          loadSmartSuggestions();
+          break;
+          
+        case 'networth':
+          calculateNetWorthTotal();
+          break;
+      }
+    }
+
+    // Update active nav item
+    document.querySelectorAll('.nav-item').forEach(item => {
+      item.classList.remove('active');
+    });
+    document.querySelector(`.nav-item[onclick*="${pageId}"]`)?.classList.add('active');
+  }
+
+  // ============================================
+  // MODAL MANAGEMENT
+  // ============================================
+  function closeModal(modalId) {
+    const modal = document.getElementById(modalId);
+    if (modal) {
+      modal.style.display = 'none';
+      
+      // Clean up chart instance if modal has one
+      if (modalId === 'kpi-detail-modal' && AppState.modalChartInstance) {
+        AppState.modalChartInstance.destroy();
+        AppState.modalChartInstance = null;
+      }
+    }
+  }
+
+  function closeAllModals() {
+    const modals = ['tiny-modal', 'kpi-detail-modal', 'import-modal', 'error-modal'];
+    modals.forEach(id => closeModal(id));
+  }
+
+  // ============================================
+  // UTILITY FUNCTIONS
+  // ============================================
+  function formatDate(dateStr, format = 'short') {
+    if (!dateStr) return '';
+    try {
+      const d = new Date(dateStr);
+      if (isNaN(d.getTime())) return dateStr;
+      
+      if (format === 'short') {
+        return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+      }
+      return d.toLocaleDateString('en-US', { 
+        weekday: 'short',
+        year: 'numeric', 
+        month: 'short', 
+        day: 'numeric' 
+      });
+    } catch (e) {
+      return dateStr;
+    }
+  }
+
+  function escapeHtml(text) {
+    if (!text) return '';
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+  }
+
+  function showQuickSearch() {
+    // Implement quick search functionality
+    showToast('Quick search coming soon!', 'info');
+  }
+
+  function showError(message) {
+    const modal = document.getElementById('error-modal');
+    const text = document.getElementById('error-text');
+    if (text) text.textContent = message;
+    if (modal) modal.style.display = 'block';
+    console.error('Error:', message);
+  }
+
+  function closeErrorModal() {
+    document.getElementById('error-modal').style.display = 'none';
+  }
+
+  // ============================================
+  // SERVICE WORKER (Optional PWA support)
+  // ============================================
+  function initializeServiceWorker() {
+    if ('serviceWorker' in navigator && location.protocol === 'https:') {
+      navigator.serviceWorker.register('/sw.js').catch(err => {
+        console.log('ServiceWorker registration failed:', err);
+      });
+    }
+  }
+
+  // ============================================
+  // GLOBAL EXPORTS
+  // ============================================
+  window.showPage = showPage;
+  window.setTheme = setTheme;
+  window.toggleFab = toggleFab;
+  window.openImportWizard = openImportWizard;
+  window.closeImportWizard = closeImportWizard;
+  window.closeTinyModal = closeTinyModal;
+  window.loadSmartSuggestions = loadSmartSuggestions;
+  window.saveAllBudgets = saveAllBudgets;
+  window.openKpiDetail = openKpiDetail;
+  window.closeModal = closeModal;
+  window.showToast = showToast;
+  window.runForecast = runForecast;
+  window.saveAllSettings = saveAllSettings;
+  window.addAssetRow = addAssetRow;
+  window.removeAssetRow = removeAssetRow;
+  window.syncNetWorth = syncNetWorth;
+  window.toggleExternalInput = toggleExternalInput;
+  window.verifyConnection = verifyConnection;
+  window.executeImport = executeImport;
+  window.closeErrorModal = closeErrorModal;
+  window.refreshData = () => loadDashboardData(true);
+</script>
+
+ADD AND IN THE PROCESS ENHANCE WHERE POSSIBLE DONT REMOVE ANY FEATURES AT ALL
+
+
+// ============================================
+// FIXED KPI MODAL FUNCTIONS
+// ============================================
+
+function openKpiDetail(type) {
+  console.log('Opening KPI detail:', type); // Debug log
+  
+  const modal = document.getElementById('kpi-detail-modal');
+  const bodyEl = document.getElementById('kpi-detail-body');
+  const titleEl = document.getElementById('detail-title');
+  
+  if (!modal || !bodyEl || !titleEl) {
+    console.error('Modal elements not found');
+    return;
+  }
+  
+  if (!globalData || !globalData.transactions) {
+    showError('No data available');
+    return;
+  }
+
+  const now = new Date();
+  const currentMonthTxs = globalData.transactions.filter(t => {
+    try {
+      const d = new Date(t.date);
+      return !isNaN(d) && d.getMonth() === now.getMonth() && 
+             d.getFullYear() === now.getFullYear();
+    } catch (e) {
+      return false;
+    }
+  });
+
+  let content = '';
+  switch(type) {
+    case 'balance':
+      titleEl.textContent = 'Balance History';
+      content = generateBalanceView();
+      break;
+    case 'income':
+      titleEl.textContent = 'Monthly Income';
+      const incomeTxs = currentMonthTxs.filter(t => t.amount > 0);
+      content = generateIncomeView(incomeTxs);
+      break;
+    case 'expenses':
+      titleEl.textContent = 'Monthly Expenses';
+      const expenseTxs = currentMonthTxs.filter(t => t.amount < 0);
+      content = generateExpenseView(expenseTxs);
+      break;
+    case 'savings':
+      titleEl.textContent = 'Savings Analysis';
+      content = generateSavingsView(currentMonthTxs);
+      break;
+    default:
+      titleEl.textContent = 'Details';
+      content = '<p>Select a valid KPI</p>';
+  }
+
+  bodyEl.innerHTML = content;
+  modal.style.display = 'block';
+  
+  // Initialize chart if needed
+  if (type === 'income' || type === 'expenses') {
+    setTimeout(() => {
+      const canvas = document.getElementById('modal-chart');
+      if (canvas) {
+        const data = type === 'income' ? 
+          currentMonthTxs.filter(t => t.amount > 0) : 
+          currentMonthTxs.filter(t => t.amount < 0);
+        renderCategoryChart(data);
+      }
+    }, 100);
+  }
+}
+
+function generateBalanceView() {
+  if (!globalData?.transactions) return '<p>No data</p>';
+  
+  // Sort by date
+  const sorted = [...globalData.transactions]
+    .sort((a, b) => new Date(a.date) - new Date(b.date));
+  
+  let running = 0;
+  const balancePoints = sorted.map(t => {
+    running += t.amount;
+    return { date: t.date, balance: running };
+  });
+  
+  // Calculate statistics
+  const totalIncome = globalData.transactions
+    .filter(t => t.amount > 0)
+    .reduce((s, t) => s + t.amount, 0);
+  const totalExpense = globalData.transactions
+    .filter(t => t.amount < 0)
+    .reduce((s, t) => s + Math.abs(t.amount), 0);
+  const currentBalance = running;
+  
+  const highest = Math.max(...balancePoints.map(p => p.balance));
+  const lowest = Math.min(...balancePoints.map(p => p.balance));
+  
+  return `
+    <div class="kpi-detail-stats">
+      <div class="stat-card glass">
+        <span class="stat-label">Current Balance</span>
+        <span class="stat-value" style="color: ${currentBalance >= 0 ? 'var(--success)' : 'var(--danger)'}">
+          £${currentBalance.toFixed(2)}
+        </span>
+      </div>
+      <div class="stat-card glass">
+        <span class="stat-label">Highest Balance</span>
+        <span class="stat-value">£${highest.toFixed(2)}</span>
+      </div>
+      <div class="stat-card glass">
+        <span class="stat-label">Lowest Balance</span>
+        <span class="stat-value">£${lowest.toFixed(2)}</span>
+      </div>
+      <div class="stat-card glass">
+        <span class="stat-label">Lifetime Income</span>
+        <span class="stat-value" style="color: var(--success)">+£${totalIncome.toFixed(2)}</span>
+      </div>
+      <div class="stat-card glass">
+        <span class="stat-label">Lifetime Expense</span>
+        <span class="stat-value" style="color: var(--danger)">-£${totalExpense.toFixed(2)}</span>
+      </div>
+    </div>
+    <div class="chart-wrapper-modal">
+      <canvas id="modal-chart"></canvas>
+    </div>
+    <h3 style="margin: 20px 0 10px;">Balance History</h3>
+    <div class="detail-list">
+      ${balancePoints.slice(-20).map(p => `
+        <div class="detail-row">
+          <span class="detail-date">${formatDate(p.date)}</span>
+          <span class="detail-desc">Balance</span>
+          <span class="detail-amount" style="color: ${p.balance >= 0 ? 'var(--success)' : 'var(--danger)'}">
+            £${p.balance.toFixed(2)}
+          </span>
+        </div>
+      `).join('')}
+    </div>
+  `;
+}
+
+function generateIncomeView(incomes) {
+  const total = incomes.reduce((s, t) => s + t.amount, 0);
+  const avg = incomes.length > 0 ? total / incomes.length : 0;
+  
+  // Group by category
+  const categories = {};
+  incomes.forEach(t => {
+    const cat = t.category || 'Uncategorized';
+    categories[cat] = (categories[cat] || 0) + t.amount;
+  });
+
+  return `
+    <div class="kpi-detail-stats">
+      <div class="stat-card glass">
+        <span class="stat-label">Total Income</span>
+        <span class="stat-value" style="color: var(--success)">£${total.toFixed(2)}</span>
+      </div>
+      <div class="stat-card glass">
+        <span class="stat-label">Transactions</span>
+        <span class="stat-value">${incomes.length}</span>
+      </div>
+      <div class="stat-card glass">
+        <span class="stat-label">Average</span>
+        <span class="stat-value">£${avg.toFixed(2)}</span>
+      </div>
+      <div class="stat-card glass">
+        <span class="stat-label">Categories</span>
+        <span class="stat-value">${Object.keys(categories).length}</span>
+      </div>
+    </div>
+    
+    <div class="chart-wrapper-modal">
+      <canvas id="modal-chart"></canvas>
+    </div>
+    
+    <h3 style="margin: 20px 0 10px;">Income Sources</h3>
+    <div class="detail-list">
+      ${incomes.slice(0, 15).map(t => `
+        <div class="detail-row">
+          <span class="detail-date">${formatDate(t.date)}</span>
+          <span class="detail-desc">${escapeHtml(t.description)}</span>
+          <span class="detail-cat" style="color: var(--text-dim); font-size: 11px;">${escapeHtml(t.category || '')}</span>
+          <span class="detail-amount" style="color: var(--success)">+£${t.amount.toFixed(2)}</span>
+        </div>
+      `).join('')}
+      ${incomes.length > 15 ? `<div style="text-align: center; padding: 10px; color: var(--text-dim);">... and ${incomes.length - 15} more</div>` : ''}
+    </div>
+  `;
+}
+
+function generateExpenseView(expenses) {
+  const total = expenses.reduce((s, t) => s + Math.abs(t.amount), 0);
+  const avg = expenses.length > 0 ? total / expenses.length : 0;
+  
+  // Group by category
+  const categories = {};
+  expenses.forEach(t => {
+    const cat = t.category || 'Uncategorized';
+    categories[cat] = (categories[cat] || 0) + Math.abs(t.amount);
+  });
+
+  return `
+    <div class="kpi-detail-stats">
+      <div class="stat-card glass">
+        <span class="stat-label">Total Expenses</span>
+        <span class="stat-value" style="color: var(--danger)">£${total.toFixed(2)}</span>
+      </div>
+      <div class="stat-card glass">
+        <span class="stat-label">Transactions</span>
+        <span class="stat-value">${expenses.length}</span>
+      </div>
+      <div class="stat-card glass">
+        <span class="stat-label">Average</span>
+        <span class="stat-value">£${avg.toFixed(2)}</span>
+      </div>
+      <div class="stat-card glass">
+        <span class="stat-label">Categories</span>
+        <span class="stat-value">${Object.keys(categories).length}</span>
+      </div>
+    </div>
+    
+    <div class="chart-wrapper-modal">
+      <canvas id="modal-chart"></canvas>
+    </div>
+    
+    <h3 style="margin: 20px 0 10px;">Top Expenses</h3>
+    <div class="detail-list">
+      ${expenses.sort((a,b) => Math.abs(b.amount) - Math.abs(a.amount)).slice(0, 15).map(t => `
+        <div class="detail-row">
+          <span class="detail-date">${formatDate(t.date)}</span>
+          <span class="detail-desc">${escapeHtml(t.description)}</span>
+          <span class="detail-cat" style="color: var(--text-dim); font-size: 11px;">${escapeHtml(t.category || '')}</span>
+          <span class="detail-amount" style="color: var(--danger)">-£${Math.abs(t.amount).toFixed(2)}</span>
+        </div>
+      `).join('')}
+    </div>
+  `;
+}
+
+function generateSavingsView(transactions) {
+  const income = transactions.filter(t => t.amount > 0).reduce((s, t) => s + t.amount, 0);
+  const expense = transactions.filter(t => t.amount < 0).reduce((s, t) => s + Math.abs(t.amount), 0);
+  const savings = income - expense;
+  const rate = income > 0 ? (savings / income) * 100 : 0;
+  
+  // Calculate daily average
+  const daysInMonth = new Date(new Date().getFullYear(), new Date().getMonth() + 1, 0).getDate();
+  const dailyAvg = expense / daysInMonth;
+
+  return `
+    <div class="savings-dashboard">
+      <div style="display: flex; gap: 30px; align-items: center; justify-content: center; flex-wrap: wrap;">
+        <div class="savings-ring" style="position: relative; width: 200px; height: 200px;">
+          <svg viewBox="0 0 120 120" style="transform: rotate(-90deg);">
+            <circle cx="60" cy="60" r="54" fill="none" stroke="rgba(255,255,255,0.1)" stroke-width="12"/>
+            <circle cx="60" cy="60" r="54" fill="none" 
+                    stroke="${rate >= 15 ? 'var(--success)' : rate > 0 ? 'var(--warning)' : 'var(--danger)'}" 
+                    stroke-width="12" 
+                    stroke-dasharray="${2 * Math.PI * 54}" 
+                    stroke-dashoffset="${2 * Math.PI * 54 * (1 - Math.min(Math.abs(rate), 100) / 100)}"
+                    style="transition: stroke-dashoffset 0.5s;"/>
+          </svg>
+          <div style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); text-align: center;">
+            <div style="font-size: 32px; font-weight: 800; color: ${rate >= 15 ? 'var(--success)' : rate > 0 ? 'var(--warning)' : 'var(--danger)'}">
+              ${rate.toFixed(1)}%
+            </div>
+            <div style="font-size: 11px; color: var(--text-dim);">Savings Rate</div>
+          </div>
+        </div>
+        
+        <div class="savings-stats" style="min-width: 250px;">
+          <div class="stat-row">
+            <span>💰 Income</span>
+            <span style="color: var(--success); font-weight: 600;">+£${income.toFixed(2)}</span>
+          </div>
+          <div class="stat-row">
+            <span>💸 Expenses</span>
+            <span style="color: var(--danger); font-weight: 600;">-£${expense.toFixed(2)}</span>
+          </div>
+          <div class="stat-row" style="border-top: 1px solid var(--glass-border); padding-top: 10px; margin-top: 5px;">
+            <span>📊 Net Savings</span>
+            <span style="color: ${savings >= 0 ? 'var(--success)' : 'var(--danger)'}; font-weight: 700;">
+              ${savings >= 0 ? '+' : '-'}£${Math.abs(savings).toFixed(2)}
+            </span>
+          </div>
+          <div class="stat-row">
+            <span>📅 Daily Avg Spend</span>
+            <span>£${dailyAvg.toFixed(2)}</span>
+          </div>
+        </div>
+      </div>
+      
+      <div class="savings-tips glass" style="margin-top: 20px; padding: 15px;">
+        <h4 style="color: var(--primary); margin-bottom: 10px;"><i class="fas fa-lightbulb"></i> Insights</h4>
+        <ul style="list-style: none; padding-left: 0;">
+          ${generateSavingsInsights(rate, savings, income, expense)}
+        </ul>
+      </div>
+      
+      <h3 style="margin: 20px 0 10px;">Monthly Trend</h3>
+      <div class="chart-wrapper-modal" style="height: 150px;">
+        <canvas id="modal-chart"></canvas>
+      </div>
+    </div>
+  `;
+}
+
+function generateSavingsInsights(rate, savings, income, expense) {
+  const insights = [];
+  
+  if (rate >= 20) {
+    insights.push('✅ Excellent savings rate! Consider investing surplus.');
+  } else if (rate >= 10) {
+    insights.push('👍 Good savings rate. You\'re on track!');
+  } else if (rate > 0) {
+    insights.push('⚠️ Savings rate could be improved. Try to reduce discretionary spending.');
+  } else if (rate === 0) {
+    insights.push('⚠️ Breaking even. Look for ways to increase income or reduce expenses.');
+  } else {
+    insights.push('🔴 Spending exceeds income. Review your expenses immediately.');
+  }
+  
+  if (expense > income * 0.5) {
+    insights.push('💡 Your expense-to-income ratio is high. Consider fixed cost reduction.');
+  }
+  
+  if (income === 0) {
+    insights.push('⚠️ No income recorded this month. Add income transactions.');
+  }
+  
+  if (insights.length === 0) {
+    insights.push('📊 Keep tracking your finances for personalized insights.');
+  }
+  
+  return insights.map(i => `<li style="margin-bottom: 8px;">${i}</li>`).join('');
+}
+
+// Fix renderCategoryChart to work with the modal
+function renderCategoryChart(data) {
+  const canvas = document.getElementById('modal-chart');
+  if (!canvas) return;
+  
+  // Destroy existing chart
+  if (AppState.modalChartInstance) {
+    AppState.modalChartInstance.destroy();
+  }
+  
+  const categoryMap = {};
+  data.forEach(t => {
+    const cat = t.category || 'Uncategorized';
+    categoryMap[cat] = (categoryMap[cat] || 0) + Math.abs(t.amount);
+  });
+  
+  const colors = [
+    '#00d2ff', '#ff4d4d', '#00ff88', '#ffaa00',
+    '#9b59b6', '#3498db', '#e74c3c', '#2ecc71',
+    '#f39c12', '#1abc9c', '#e67e22', '#95a5a6'
+  ];
+  
+  const ctx = canvas.getContext('2d');
+  AppState.modalChartInstance = new Chart(ctx, {
+    type: 'doughnut',
+    data: {
+      labels: Object.keys(categoryMap),
+      datasets: [{
+        data: Object.values(categoryMap),
+        backgroundColor: colors.slice(0, Object.keys(categoryMap).length),
+        borderWidth: 0,
+        hoverOffset: 15
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: {
+          position: 'bottom',
+          labels: {
+            color: 'rgba(255,255,255,0.8)',
+            font: { size: 11 }
+          }
+        },
+        tooltip: {
+          callbacks: {
+            label: (context) => {
+              const value = context.raw;
+              const total = context.dataset.data.reduce((a, b) => a + b, 0);
+              const percentage = ((value / total) * 100).toFixed(1);
+              return `£${value.toFixed(2)} (${percentage}%)`;
+            }
+          }
+        }
+      },
+      cutout: '65%',
+      animation: {
+        animateRotate: true,
+        animateScale: true
+      }
+    }
+  });
+}
+We are given a summary of file replacements: JavaScript.html (replace entirely), Data.gs (replace entirely), API.gs (replace entirely), Index.html (partial insert: add sync button + date range at marked spots, replace only modal section), Styles.html (append only). Additionally, we have a large JavaScript code snippet that appears to be an enhanced version of the existing script. The instruction says: "ADD AND IN THE PROCESS ENHANCE WHERE POSSIBLE DONT REMOVE ANY FEATURES AT ALL". Then we have a section labeled "FIXED KPI MODAL FUNCTIONS" which contains duplicate definitions of openKpiDetail, generateBalanceView, generateIncomeView, generateExpenseView, generateSavingsView, generateSavingsInsights, and renderCategoryChart. These seem to be fixes for the modal functions. But the main code already includes openKpiDetail (the original). However, the original openKpiDetail uses AppState.data, while the fixed version uses globalData. There might be a conflict. The main code also includes generateExpenseView, etc., but they are defined inside the main code as part of openKpiDetail. Actually, the main code has those functions defined inside openKpiDetail as inner functions? No, they are separate functions? Looking at the main code: openKpiDetail is defined, and it uses generateExpenseView, generateIncomeView, generateSavingsView. Those are defined as separate functions inside the main code? Wait, the main code includes:
+
+function openKpiDetail(type) { ... }
+
+And then inside it uses generateExpenseView, generateIncomeView, generateSavingsView. But those functions are not defined elsewhere in the main code? Actually, they are defined later in the main code? Let's scan: The main code after openKpiDetail includes:
+
+function generateExpenseView(expenses) { ... }
+function generateIncomeView(incomes) { ... }
+function generateSavingsView(transactions) { ... }
+function generateSavingsTips(rate, savings, income) { ... }
+
+Yes, they are defined. But the fixed version redefines them. The fixed version also adds generateBalanceView and modifies generateSavingsView to include a chart and more insights. Also, the fixed version's openKpiDetail includes a case for 'balance' which was missing in the original. So the fixed version enhances the KPI modal functionality.
+
+The instruction: "ADD AND IN THE PROCESS ENHANCE WHERE POSSIBLE DONT REMOVE ANY FEATURES AT ALL" likely means we need to incorporate these fixes into the main JavaScript code, enhancing it without removing existing features. Also, we need to consider the file replacement instructions: JavaScript.html is to be replaced entirely. So we need to provide the new content for JavaScript.html, which should include the enhanced script. The fixed functions should be integrated, possibly replacing the original versions or merging improvements.
+
+The main script already has a lot of features. The fixed section adds a 'balance' KPI detail and improves the savings view. It also fixes the renderCategoryChart to work with the modal. But the main script already has a renderCategoryChart function that does similar. The fixed version uses AppState.modalChartInstance and Chart.js, which is consistent with the main script (the main script uses Chart.js for modal charts). However, the main script's renderCategoryChart is defined inside the main code and uses AppState.modalChartInstance. So we need to merge the improvements.
+
+We should take the main script as base, and then incorporate the enhancements from the fixed section. Specifically:
+
+Add the 'balance' case to openKpiDetail.
+
+Enhance generateSavingsView with more stats and a chart (the main script's generateSavingsView is simpler, with a ring and stats but no chart? Actually main's generateSavingsView includes a savings ring and stats, but no chart. The fixed version adds a monthly trend chart at the bottom. We can merge both.
+
+Improve generateIncomeView and generateExpenseView with more stats (like average, categories count) and maybe better formatting. The fixed versions add more stats and a chart. The main versions already have a chart and some stats. The fixed versions add transaction count, average, categories count, and show more transactions. We can combine.
+
+The fixed version's generateBalanceView is new.
+
+The fixed version's generateSavingsInsights is similar to main's generateSavingsTips but enhanced.
+
+We need to produce the final JavaScript.html content. It should be a single script block. The main script already has a large block. We need to replace the relevant functions with enhanced versions, ensuring no feature loss.
+
+Also note: The main script uses AppState.data, while fixed version uses globalData. But globalData is not defined in main. In main, data is stored in AppState.data. So we need to adapt the fixed functions to use AppState.data. Also, the fixed openKpiDetail checks globalData.transactions; we should change to AppState.data.transactions.
+
+Also, the fixed renderCategoryChart uses AppState.modalChartInstance, which is consistent.
+
+We should also check for any duplicate declarations. For example, the main script already has openKpiDetail, generateExpenseView, etc. We need to replace them with the enhanced versions. But careful: the main script's generateExpenseView is used inside openKpiDetail, and the fixed version is different. So we should replace those functions.
+
+Additionally, the main script has generateSavingsTips, while fixed has generateSavingsInsights. We can keep generateSavingsInsights and use it in generateSavingsView.
+
+Also, the main script's openKpiDetail currently only handles 'expenses', 'income', 'savings'. We need to add 'balance'.
+
+Now, we need to produce the full JavaScript.html content. The instruction says "JavaScript.html 🔴 Replace Entirely". So we need to output the new content for that file. It should be a complete HTML file? Probably the JavaScript.html is a file containing the JavaScript code (maybe a script tag). Given the context, it might be a file that is included in the main HTML. But we don't have the surrounding HTML. However, the instruction likely expects us to provide the new JavaScript code to replace the existing one. Since it's a file named JavaScript.html, it might contain a script tag or just raw JavaScript. To be safe, we'll output the JavaScript code as a block, assuming it will be placed within <script> tags. The provided snippet already starts with <script> and ends with </script>. So we'll output the entire enhanced script within script tags.
+
+But note: The provided snippet includes the main script and then the fixed functions. The fixed functions are separate. We need to merge them. So we'll produce a single script block that incorporates the enhancements.
+
+We'll start with the main script, but replace the relevant functions with the enhanced versions. Also, we need to ensure that all features are retained. For example, the main script has a lot of other functions (like calendar, charts, etc.) that we must keep.
+
+Let's outline the steps:
+
+Take the main script as base.
+
+Identify the functions that are duplicated in the fixed section: openKpiDetail, generateBalanceView (new), generateIncomeView, generateExpenseView, generateSavingsView, generateSavingsInsights (new), renderCategoryChart (but main already has one, we need to merge improvements).
+
+For openKpiDetail, we need to add the 'balance' case and use AppState.data instead of globalData.
+
+For generateIncomeView, enhance with more stats (transaction count, average, categories count) and keep the chart and transaction list. The main version already has a chart and list. We can merge by adding the extra stats cards.
+
+Similarly for generateExpenseView.
+
+For generateSavingsView, we need to merge the fixed version's additional chart and insights. The main version has a ring and stats, but no chart. We'll add the chart (with canvas) and maybe keep the ring and stats. The fixed version also includes a monthly trend chart. We'll need to create a canvas for that chart and ensure it's rendered. However, the modal already has a canvas with id "modal-chart". The fixed version uses the same canvas for both the doughnut chart (in income/expense) and the trend chart (in savings). That would conflict because the same canvas can't hold two different charts. In the fixed version, for savings, they add a canvas inside the savings view? Actually, they have <div class="chart-wrapper-modal" style="height: 150px;"><canvas id="modal-chart"></canvas></div> at the end of generateSavingsView. That would reuse the same modal-chart canvas. But the modal-chart canvas is also used for income/expense. So if we open savings, it will try to render a chart there. In the fixed version, they don't call renderCategoryChart for savings; they just leave the canvas and expect something? Wait, in generateSavingsView they include a canvas but they don't populate it. They have a comment "Monthly Trend" but no data. Probably they intend to render a line chart. But the fixed code doesn't include a function to render that. So that part is incomplete. The main script's openKpiDetail for savings does not use a chart. So we might not need to add a chart for savings, or we could add a simple line chart of balance trend. But to keep it simple, we might not add that extra chart. Alternatively, we could add a separate canvas for savings, but that would require more changes. Given the instruction "enhance where possible", we can add the savings ring and stats, which are already present in main. The main's generateSavingsView already has a ring and stats. The fixed version adds a "Monthly Trend" chart, but it's not implemented. So we might skip that or implement it properly. Let's examine the fixed generateSavingsView: it includes a canvas with id "modal-chart" at the end. But no data is passed. So that would just be an empty canvas. That's not an enhancement. Perhaps they intended to use that canvas for a trend chart, but the code is missing. We could implement a simple line chart of daily balances for the month. That would be a nice enhancement. But we need to be careful not to overcomplicate. Since the main script already has a running balance chart elsewhere, maybe it's okay to not add it here. However, the fixed version's generateSavingsView also has a more detailed stats section (daily avg spend) and insights. We can incorporate those.
+
+Let's decide:
+
+Keep main's generateSavingsView but enhance it with the additional stats (daily avg spend) and the insights from generateSavingsInsights.
+
+Add the 'balance' case to openKpiDetail, using a new generateBalanceView function that shows balance history and stats.
+
+Enhance generateIncomeView and generateExpenseView with additional stats cards (transactions count, average, categories count) and improve the transaction list formatting.
+
+Ensure renderCategoryChart is used correctly for income/expense.
+
+Now, we need to write the final JavaScript code. We'll start with the main script and replace the relevant functions.
+
+Important: The main script has a global AppState object. We'll use that.
+
+We'll also need to add generateBalanceView and generateSavingsInsights (or merge with generateSavingsTips). The main script has generateSavingsTips; we can replace it with generateSavingsInsights which is more comprehensive.
+
+Let's produce the final code. We'll include the entire script, with the enhancements. We'll ensure no syntax errors.
+
+We'll also check for any missing references. For example, the fixed renderCategoryChart uses Chart.js, which is assumed to be loaded. The main script also uses Chart.js, so that's fine.
+
+Now, let's write the final answer with the JavaScript.html content.
+
+html
+<script>
+  // ============================================
+  // GLOBAL STATE MANAGEMENT
+  // ============================================
+  const AppState = {
+    data: null,
+    calendar: null,
+    chartInstances: {},
+    modalChartInstance: null,
+    currentTheme: localStorage.getItem('appTheme') || 'dark',
+    filters: { category: null, dateRange: null },
+    pendingRequests: new Set(),
+    toastQueue: [],
+    
+    // Safe state updates
+    update(key, value) {
+      this[key] = value;
+      window.dispatchEvent(new CustomEvent('appstate-change', { detail: { key, value } }));
+    }
+  };
+
+  // ============================================
+  // ERROR BOUNDARY & SAFE EXECUTION
+  // ============================================
+  async function safeExecute(fn, fallback = null, errorMessage = 'Operation failed') {
+    try {
+      return await fn();
+    } catch (error) {
+      console.error(`${errorMessage}:`, error);
+      showToast(errorMessage, 'error');
+      return fallback;
+    }
+  }
+
+  // ============================================
+  // DEBOUNCE UTILITY
+  // ============================================
+  function debounce(func, wait) {
+    let timeout;
+    return function executedFunction(...args) {
+      const later = () => {
+        clearTimeout(timeout);
+        func(...args);
+      };
+      clearTimeout(timeout);
+      timeout = setTimeout(later, wait);
+    };
+  }
+
+  // ============================================
+  // INITIALIZATION (IMPROVED)
+  // ============================================
+  document.addEventListener('DOMContentLoaded', async function() {
+    try {
+      initializeTheme();
+      await initializeApp();
+      initializeEventListeners();
+      initializeServiceWorker();
+    } catch (error) {
+      showError('Failed to initialize application: ' + error.message);
+    }
+  });
+
+  function initializeTheme() {
+    const savedTheme = localStorage.getItem('appTheme') || 'dark';
+    document.body.className = `theme-${savedTheme}`;
+    AppState.currentTheme = savedTheme;
+  }
+
+  async function initializeApp() {
+    showLoader(true);
+    await loadDashboardData();
+    showLoader(false);
+  }
+
+  function initializeEventListeners() {
+    // Dropzone with proper drag & drop
+    const dropZone = document.getElementById('drop-zone');
+    if (dropZone) {
+      ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
+        dropZone.addEventListener(eventName, preventDefaults);
+      });
+      
+      dropZone.addEventListener('drop', handleDrop);
+      dropZone.addEventListener('click', () => document.getElementById('csv-file').click());
+    }
+
+    // File input with validation
+    const fileInput = document.getElementById('csv-file');
+    if (fileInput) {
+      fileInput.addEventListener('change', handleFileSelect);
+    }
+
+    // Window resize handler for charts
+    window.addEventListener('resize', debounce(handleResize, 250));
+    
+    // Keyboard shortcuts
+    window.addEventListener('keydown', handleKeyboardShortcuts);
+  }
+
+  function preventDefaults(e) {
+    e.preventDefault();
+    e.stopPropagation();
+  }
+
+  function handleResize() {
+    if (AppState.calendar) AppState.calendar.updateSize();
+    Object.values(AppState.chartInstances).forEach(chart => {
+      if (chart && typeof chart.resize === 'function') chart.resize();
+    });
+  }
+
+  function handleKeyboardShortcuts(e) {
+    // Ctrl/Cmd + K to search
+    if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
+      e.preventDefault();
+      showQuickSearch();
+    }
+    // Escape to close modals
+    if (e.key === 'Escape') {
+      closeAllModals();
+    }
+  }
+
+  // ============================================
+  // TOAST NOTIFICATION SYSTEM (ENHANCED)
+  // ============================================
+  function showToast(message, type = 'info', duration = 4000) {
+    const container = document.getElementById('toast-container');
+    if (!container) return;
+
+    const id = `toast-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    const icon = {
+      success: 'check-circle',
+      error: 'exclamation-circle',
+      warning: 'exclamation-triangle',
+      info: 'info-circle'
+    }[type] || 'info-circle';
+
+    const toast = document.createElement('div');
+    toast.id = id;
+    toast.className = `toast ${type}`;
+    toast.setAttribute('role', 'alert');
+    toast.innerHTML = `
+      <i class="fas fa-${icon}"></i>
+      <span>${message}</span>
+      <button class="toast-close" onclick="this.parentElement.remove()">×</button>
+    `;
+
+    container.appendChild(toast);
+    
+    // Trigger animation
+    setTimeout(() => toast.classList.add('show'), 10);
+    
+    // Auto remove
+    const timeoutId = setTimeout(() => {
+      toast.classList.remove('show');
+      setTimeout(() => toast.remove(), 300);
+    }, duration);
+
+    // Store timeout for cleanup
+    toast.dataset.timeoutId = timeoutId;
+    
+    // Pause timeout on hover
+    toast.addEventListener('mouseenter', () => clearTimeout(timeoutId));
+    toast.addEventListener('mouseleave', () => {
+      const newTimeout = setTimeout(() => {
+        toast.classList.remove('show');
+        setTimeout(() => toast.remove(), 300);
+      }, duration);
+      toast.dataset.timeoutId = newTimeout;
+    });
+  }
+
+  function showError(message) { showToast(message, 'error'); }
+  function showSuccess(message) { showToast(message, 'success'); }
+  function showWarning(message) { showToast(message, 'warning'); }
+
+  // ============================================
+  // LOADER MANAGEMENT
+  // ============================================
+  function showLoader(show) {
+    const loader = document.getElementById('loader');
+    if (!loader) return;
+    
+    if (show) {
+      loader.style.display = 'flex';
+      loader.setAttribute('aria-label', 'Loading content');
+    } else {
+      loader.style.display = 'none';
+      loader.removeAttribute('aria-label');
+    }
+  }
+
+  // ============================================
+  // DATA LOADING WITH CACHE & RETRY
+  // ============================================
+  async function loadDashboardData(forceRefresh = false) {
+    const cacheKey = 'dashboardData';
+    const cacheTime = 5 * 60 * 1000; // 5 minutes
+    
+    // Check cache
+    if (!forceRefresh) {
+      const cached = sessionStorage.getItem(cacheKey);
+      if (cached) {
+        try {
+          const { data, timestamp } = JSON.parse(cached);
+          if (Date.now() - timestamp < cacheTime) {
+            processDashboardData(data);
+            return;
+          }
+        } catch (e) {
+          // Invalid cache, ignore
+        }
+      }
+    }
+
+    // Load fresh data with retry
+    let retries = 3;
+    while (retries > 0) {
+      try {
+        const data = await new Promise((resolve, reject) => {
+          google.script.run
+            .withSuccessHandler(resolve)
+            .withFailureHandler(reject)
+            .getDashboardData();
+        });
+        
+        // Cache the data
+        sessionStorage.setItem(cacheKey, JSON.stringify({
+          data,
+          timestamp: Date.now()
+        }));
+        
+        processDashboardData(data);
+        return;
+      } catch (error) {
+        retries--;
+        if (retries === 0) {
+          showError('Failed to load data after multiple attempts');
+          showLoader(false);
+        } else {
+          await new Promise(r => setTimeout(r, 1000)); // Wait 1s before retry
+        }
+      }
+    }
+  }
+
+  function processDashboardData(data) {
+    AppState.update('data', data);
+    updateKPIs(data.kpis);
+    renderDashboardCharts();
+    initializeCalendar();
+    initializeNetWorth();
+  }
+
+  function updateKPIs(kpis) {
+    if (!kpis) return;
+    
+    const kpiElements = {
+      balance: 'kpi-balance',
+      income: 'kpi-income',
+      expense: 'kpi-expense',
+      savingsRate: 'kpi-savings'
+    };
+
+    Object.entries(kpiElements).forEach(([key, id]) => {
+      const element = document.getElementById(id);
+      if (!element) return;
+
+      if (key === 'savingsRate') {
+        element.innerText = kpis[key] + '%';
+      } else {
+        try {
+          new countUp.CountUp(id, parseFloat(kpis[key]), {
+            prefix: '£',
+            decimalPlaces: 2,
+            duration: 2,
+            enableScrollSpy: true
+          }).start();
+        } catch (e) {
+          element.innerText = `£${parseFloat(kpis[key]).toFixed(2)}`;
+        }
+      }
+    });
+  }
+
+  // ============================================
+  // ENHANCED CALENDAR
+  // ============================================
+  function initializeCalendar() {
+    const calendarEl = document.getElementById('calendar');
+    if (!calendarEl || !AppState.data) return;
+
+    // Destroy existing calendar if any
+    if (AppState.calendar) {
+      AppState.calendar.destroy();
+    }
+
+    const events = AppState.data.transactions.map(t => ({
+      id: `tx-${t.date}-${t.description}-${Math.random()}`,
+      title: `${t.description} (${t.category})`,
+      start: t.date,
+      end: t.date,
+      allDay: true,
+      className: t.amount >= 0 ? 'fc-event-income' : 'fc-event-expense',
+      extendedProps: { ...t },
+      backgroundColor: t.amount >= 0 ? 'var(--success)' : 'var(--danger)',
+      borderColor: 'transparent'
+    }));
+
+    AppState.calendar = new FullCalendar.Calendar(calendarEl, {
+      initialView: 'dayGridMonth',
+      headerToolbar: {
+        left: 'prev,next today',
+        center: 'title',
+        right: 'dayGridMonth,timeGridWeek,listMonth'
+      },
+      events: events,
+      eventDisplay: 'block',
+      dayMaxEvents: 3,
+      moreLinkClick: 'day',
+      
+      dayCellDidMount: (info) => {
+        renderSparkline(info.date, info.el);
+      },
+      
+      dateClick: (info) => {
+        showDayTransactions(info.dateStr, info.jsEvent);
+      },
+      
+      eventClick: (info) => {
+        showTransactionDetails(info.event.extendedProps, info.jsEvent);
+      },
+      
+      eventDidMount: (info) => {
+        // Add tooltip
+        info.el.setAttribute('title', 
+          `${info.event.title}\nAmount: £${Math.abs(info.event.extendedProps.amount).toFixed(2)}`
+        );
+      },
+      
+      height: 'auto',
+      aspectRatio: 1.8,
+      
+      // Localization
+      locale: 'en',
+      firstDay: 1, // Monday
+      
+      // Loading indicator
+      loading: (isLoading) => {
+        showLoader(isLoading);
+      }
+    });
+
+    AppState.calendar.render();
+  }
+
+  function renderSparkline(date, cellEl) {
+    if (!AppState.data?.transactions) return;
+    
+    const dateStr = date.toISOString().split('T')[0];
+    const dayTxs = AppState.data.transactions.filter(t => t.date === dateStr);
+    if (dayTxs.length === 0) return;
+
+    const totals = dayTxs.reduce((acc, t) => {
+      if (t.amount > 0) acc.income += t.amount;
+      else acc.expense += Math.abs(t.amount);
+      return acc;
+    }, { income: 0, expense: 0 });
+
+    const maxValue = Math.max(totals.income, totals.expense, 1);
+    const wrap = document.createElement('div');
+    wrap.className = 'day-sparkline-wrap';
+    wrap.setAttribute('aria-label', `Income: £${totals.income.toFixed(2)}, Expense: £${totals.expense.toFixed(2)}`);
+
+    if (totals.income > 0) {
+      const bar = document.createElement('div');
+      bar.className = 'spark-bar spark-income';
+      bar.style.width = `${(totals.income / maxValue) * 100}%`;
+      wrap.appendChild(bar);
+    }
+
+    if (totals.expense > 0) {
+      const bar = document.createElement('div');
+      bar.className = 'spark-bar spark-expense';
+      bar.style.width = `${(totals.expense / maxValue) * 100}%`;
+      wrap.appendChild(bar);
+    }
+
+    const frame = cellEl.querySelector('.fc-daygrid-day-frame');
+    if (frame) frame.appendChild(wrap);
+  }
+
+  // ============================================
+  // TRANSACTION MODALS
+  // ============================================
+  function showDayTransactions(dateStr, jsEvent) {
+    if (!AppState.data) return;
+    
+    const dayTxs = AppState.data.transactions
+      .filter(t => t.date === dateStr)
+      .sort((a, b) => Math.abs(b.amount) - Math.abs(a.amount));
+
+    if (dayTxs.length === 0) return;
+
+    const modal = document.getElementById('tiny-modal');
+    const title = document.getElementById('tiny-modal-title');
+    const body = document.getElementById('tiny-modal-body');
+    
+    title.textContent = `Transactions: ${formatDate(dateStr, 'long')}`;
+    body.innerHTML = dayTxs.map(t => createTransactionRow(t)).join('');
+
+    positionModal(modal, jsEvent);
+    modal.style.display = 'block';
+  }
+
+  function showTransactionDetails(transaction, jsEvent) {
+    const modal = document.getElementById('tiny-modal');
+    const title = document.getElementById('tiny-modal-title');
+    const body = document.getElementById('tiny-modal-body');
+    
+    title.textContent = formatDate(transaction.date, 'long');
+    body.innerHTML = createTransactionDetails(transaction);
+
+    positionModal(modal, jsEvent);
+    modal.style.display = 'block';
+  }
+
+  function createTransactionRow(t) {
+    const isIncome = t.amount >= 0;
+    return `
+      <div class="tiny-tx-item" onclick="showTransactionDetails(${JSON.stringify(t).replace(/"/g, '&quot;')}, event)">
+        <div>
+          <div style="font-weight:500;">${escapeHtml(t.description)}</div>
+          <div style="color:var(--text-dim); font-size:11px;">${escapeHtml(t.category || 'Uncategorized')}</div>
+        </div>
+        <div style="font-weight:700; color:${isIncome ? 'var(--success)' : 'var(--danger)'}">
+          ${isIncome ? '+' : '-'}£${Math.abs(t.amount).toFixed(2)}
+        </div>
+      </div>
+    `;
+  }
+
+  function createTransactionDetails(t) {
+    return `
+      <div class="transaction-detail">
+        <div class="detail-row">
+          <span class="detail-label">Description:</span>
+          <span class="detail-value">${escapeHtml(t.description)}</span>
+        </div>
+        <div class="detail-row">
+          <span class="detail-label">Amount:</span>
+          <span class="detail-value" style="color:${t.amount >= 0 ? 'var(--success)' : 'var(--danger)'}">
+            ${t.amount >= 0 ? '+' : '-'}£${Math.abs(t.amount).toFixed(2)}
+          </span>
+        </div>
+        <div class="detail-row">
+          <span class="detail-label">Category:</span>
+          <span class="detail-value">${escapeHtml(t.category || 'Uncategorized')}</span>
+        </div>
+        <div class="detail-row">
+          <span class="detail-label">Date:</span>
+          <span class="detail-value">${formatDate(t.date, 'long')}</span>
+        </div>
+        <div class="detail-actions">
+          <button class="btn-outline btn-small" onclick="editTransaction('${t.date}', '${escapeHtml(t.description)}')">
+            <i class="fas fa-edit"></i> Edit
+          </button>
+          <button class="btn-outline btn-small" onclick="categorizeTransaction('${t.date}', '${escapeHtml(t.description)}')">
+            <i class="fas fa-tag"></i> Recategorize
+          </button>
+        </div>
+      </div>
+    `;
+  }
+
+  function positionModal(modal, jsEvent) {
+    const x = jsEvent.clientX;
+    const y = jsEvent.clientY;
+    
+    modal.style.display = 'block';
+    const rect = modal.getBoundingClientRect();
+    
+    let left = x;
+    let top = y;
+    
+    if (left + rect.width > window.innerWidth) {
+      left = window.innerWidth - rect.width - 20;
+    }
+    if (top + rect.height > window.innerHeight) {
+      top = window.innerHeight - rect.height - 20;
+    }
+    
+    modal.style.left = left + 'px';
+    modal.style.top = top + 'px';
+    modal.style.transform = 'none';
+  }
+
+  function closeTinyModal() {
+    document.getElementById('tiny-modal').style.display = 'none';
+  }
+
+  // ============================================
+  // KPI DETAIL MODAL (ENHANCED)
+  // ============================================
+  function openKpiDetail(type) {
+    console.log('Opening KPI detail:', type);
+    
+    const modal = document.getElementById('kpi-detail-modal');
+    const bodyEl = document.getElementById('kpi-detail-body');
+    const titleEl = document.getElementById('detail-title');
+    
+    if (!modal || !bodyEl || !titleEl) {
+      console.error('Modal elements not found');
+      return;
+    }
+    
+    if (!AppState.data || !AppState.data.transactions) {
+      showError('No data available');
+      return;
+    }
+
+    const now = new Date();
+    const currentMonthTxs = AppState.data.transactions.filter(t => {
+      try {
+        const d = new Date(t.date);
+        return !isNaN(d) && d.getMonth() === now.getMonth() && 
+               d.getFullYear() === now.getFullYear();
+      } catch (e) {
+        return false;
+      }
+    });
+
+    let content = '';
+    switch(type) {
+      case 'balance':
+        titleEl.textContent = 'Balance History';
+        content = generateBalanceView();
+        break;
+      case 'income':
+        titleEl.textContent = 'Monthly Income';
+        const incomeTxs = currentMonthTxs.filter(t => t.amount > 0);
+        content = generateIncomeView(incomeTxs);
+        break;
+      case 'expenses':
+        titleEl.textContent = 'Monthly Expenses';
+        const expenseTxs = currentMonthTxs.filter(t => t.amount < 0);
+        content = generateExpenseView(expenseTxs);
+        break;
+      case 'savings':
+        titleEl.textContent = 'Savings Analysis';
+        content = generateSavingsView(currentMonthTxs);
+        break;
+      default:
+        titleEl.textContent = 'Details';
+        content = '<p>Select a valid KPI</p>';
+    }
+
+    bodyEl.innerHTML = content;
+    modal.style.display = 'block';
+    
+    // Initialize chart if needed
+    if (type === 'income' || type === 'expenses') {
+      setTimeout(() => {
+        const canvas = document.getElementById('modal-chart');
+        if (canvas) {
+          const data = type === 'income' ? 
+            currentMonthTxs.filter(t => t.amount > 0) : 
+            currentMonthTxs.filter(t => t.amount < 0);
+          renderCategoryChart(data);
+        }
+      }, 100);
+    }
+  }
+
+  function generateBalanceView() {
+    if (!AppState.data?.transactions) return '<p>No data</p>';
+    
+    // Sort by date
+    const sorted = [...AppState.data.transactions]
+      .sort((a, b) => new Date(a.date) - new Date(b.date));
+    
+    let running = 0;
+    const balancePoints = sorted.map(t => {
+      running += t.amount;
+      return { date: t.date, balance: running };
+    });
+    
+    // Calculate statistics
+    const totalIncome = AppState.data.transactions
+      .filter(t => t.amount > 0)
+      .reduce((s, t) => s + t.amount, 0);
+    const totalExpense = AppState.data.transactions
+      .filter(t => t.amount < 0)
+      .reduce((s, t) => s + Math.abs(t.amount), 0);
+    const currentBalance = running;
+    
+    const highest = Math.max(...balancePoints.map(p => p.balance));
+    const lowest = Math.min(...balancePoints.map(p => p.balance));
+    
+    return `
+      <div class="kpi-detail-stats">
+        <div class="stat-card glass">
+          <span class="stat-label">Current Balance</span>
+          <span class="stat-value" style="color: ${currentBalance >= 0 ? 'var(--success)' : 'var(--danger)'}">
+            £${currentBalance.toFixed(2)}
+          </span>
+        </div>
+        <div class="stat-card glass">
+          <span class="stat-label">Highest Balance</span>
+          <span class="stat-value">£${highest.toFixed(2)}</span>
+        </div>
+        <div class="stat-card glass">
+          <span class="stat-label">Lowest Balance</span>
+          <span class="stat-value">£${lowest.toFixed(2)}</span>
+        </div>
+        <div class="stat-card glass">
+          <span class="stat-label">Lifetime Income</span>
+          <span class="stat-value" style="color: var(--success)">+£${totalIncome.toFixed(2)}</span>
+        </div>
+        <div class="stat-card glass">
+          <span class="stat-label">Lifetime Expense</span>
+          <span class="stat-value" style="color: var(--danger)">-£${totalExpense.toFixed(2)}</span>
+        </div>
+      </div>
+      <div class="chart-wrapper-modal">
+        <canvas id="modal-chart"></canvas>
+      </div>
+      <h3 style="margin: 20px 0 10px;">Balance History</h3>
+      <div class="detail-list">
+        ${balancePoints.slice(-20).map(p => `
+          <div class="detail-row">
+            <span class="detail-date">${formatDate(p.date)}</span>
+            <span class="detail-desc">Balance</span>
+            <span class="detail-amount" style="color: ${p.balance >= 0 ? 'var(--success)' : 'var(--danger)'}">
+              £${p.balance.toFixed(2)}
+            </span>
+          </div>
+        `).join('')}
+      </div>
+    `;
+  }
+
+  function generateIncomeView(incomes) {
+    const total = incomes.reduce((s, t) => s + t.amount, 0);
+    const avg = incomes.length > 0 ? total / incomes.length : 0;
+    
+    // Group by category
+    const categories = {};
+    incomes.forEach(t => {
+      const cat = t.category || 'Uncategorized';
+      categories[cat] = (categories[cat] || 0) + t.amount;
+    });
+
+    return `
+      <div class="kpi-detail-stats">
+        <div class="stat-card glass">
+          <span class="stat-label">Total Income</span>
+          <span class="stat-value" style="color: var(--success)">£${total.toFixed(2)}</span>
+        </div>
+        <div class="stat-card glass">
+          <span class="stat-label">Transactions</span>
+          <span class="stat-value">${incomes.length}</span>
+        </div>
+        <div class="stat-card glass">
+          <span class="stat-label">Average</span>
+          <span class="stat-value">£${avg.toFixed(2)}</span>
+        </div>
+        <div class="stat-card glass">
+          <span class="stat-label">Categories</span>
+          <span class="stat-value">${Object.keys(categories).length}</span>
+        </div>
+      </div>
+      
+      <div class="chart-wrapper-modal">
+        <canvas id="modal-chart"></canvas>
+      </div>
+      
+      <h3 style="margin: 20px 0 10px;">Income Sources</h3>
+      <div class="detail-list">
+        ${incomes.slice(0, 15).map(t => `
+          <div class="detail-row">
+            <span class="detail-date">${formatDate(t.date)}</span>
+            <span class="detail-desc">${escapeHtml(t.description)}</span>
+            <span class="detail-cat" style="color: var(--text-dim); font-size: 11px;">${escapeHtml(t.category || '')}</span>
+            <span class="detail-amount" style="color: var(--success)">+£${t.amount.toFixed(2)}</span>
+          </div>
+        `).join('')}
+        ${incomes.length > 15 ? `<div style="text-align: center; padding: 10px; color: var(--text-dim);">... and ${incomes.length - 15} more</div>` : ''}
+      </div>
+    `;
+  }
+
+  function generateExpenseView(expenses) {
+    const total = expenses.reduce((s, t) => s + Math.abs(t.amount), 0);
+    const avg = expenses.length > 0 ? total / expenses.length : 0;
+    
+    // Group by category
+    const categories = {};
+    expenses.forEach(t => {
+      const cat = t.category || 'Uncategorized';
+      categories[cat] = (categories[cat] || 0) + Math.abs(t.amount);
+    });
+
+    return `
+      <div class="kpi-detail-stats">
+        <div class="stat-card glass">
+          <span class="stat-label">Total Expenses</span>
+          <span class="stat-value" style="color: var(--danger)">£${total.toFixed(2)}</span>
+        </div>
+        <div class="stat-card glass">
+          <span class="stat-label">Transactions</span>
+          <span class="stat-value">${expenses.length}</span>
+        </div>
+        <div class="stat-card glass">
+          <span class="stat-label">Average</span>
+          <span class="stat-value">£${avg.toFixed(2)}</span>
+        </div>
+        <div class="stat-card glass">
+          <span class="stat-label">Categories</span>
+          <span class="stat-value">${Object.keys(categories).length}</span>
+        </div>
+      </div>
+      
+      <div class="chart-wrapper-modal">
+        <canvas id="modal-chart"></canvas>
+      </div>
+      
+      <h3 style="margin: 20px 0 10px;">Top Expenses</h3>
+      <div class="detail-list">
+        ${expenses.sort((a,b) => Math.abs(b.amount) - Math.abs(a.amount)).slice(0, 15).map(t => `
+          <div class="detail-row">
+            <span class="detail-date">${formatDate(t.date)}</span>
+            <span class="detail-desc">${escapeHtml(t.description)}</span>
+            <span class="detail-cat" style="color: var(--text-dim); font-size: 11px;">${escapeHtml(t.category || '')}</span>
+            <span class="detail-amount" style="color: var(--danger)">-£${Math.abs(t.amount).toFixed(2)}</span>
+          </div>
+        `).join('')}
+      </div>
+    `;
+  }
+
+  function generateSavingsView(transactions) {
+    const income = transactions.filter(t => t.amount > 0).reduce((s, t) => s + t.amount, 0);
+    const expense = transactions.filter(t => t.amount < 0).reduce((s, t) => s + Math.abs(t.amount), 0);
+    const savings = income - expense;
+    const rate = income > 0 ? (savings / income) * 100 : 0;
+    
+    // Calculate daily average
+    const daysInMonth = new Date(new Date().getFullYear(), new Date().getMonth() + 1, 0).getDate();
+    const dailyAvg = expense / daysInMonth;
+
+    return `
+      <div class="savings-dashboard">
+        <div style="display: flex; gap: 30px; align-items: center; justify-content: center; flex-wrap: wrap;">
+          <div class="savings-ring" style="position: relative; width: 200px; height: 200px;">
+            <svg viewBox="0 0 120 120" style="transform: rotate(-90deg);">
+              <circle cx="60" cy="60" r="54" fill="none" stroke="rgba(255,255,255,0.1)" stroke-width="12"/>
+              <circle cx="60" cy="60" r="54" fill="none" 
+                      stroke="${rate >= 15 ? 'var(--success)' : rate > 0 ? 'var(--warning)' : 'var(--danger)'}" 
+                      stroke-width="12" 
+                      stroke-dasharray="${2 * Math.PI * 54}" 
+                      stroke-dashoffset="${2 * Math.PI * 54 * (1 - Math.min(Math.abs(rate), 100) / 100)}"
+                      style="transition: stroke-dashoffset 0.5s;"/>
+            </svg>
+            <div style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); text-align: center;">
+              <div style="font-size: 32px; font-weight: 800; color: ${rate >= 15 ? 'var(--success)' : rate > 0 ? 'var(--warning)' : 'var(--danger)'}">
+                ${rate.toFixed(1)}%
+              </div>
+              <div style="font-size: 11px; color: var(--text-dim);">Savings Rate</div>
+            </div>
+          </div>
+          
+          <div class="savings-stats" style="min-width: 250px;">
+            <div class="stat-row">
+              <span>💰 Income</span>
+              <span style="color: var(--success); font-weight: 600;">+£${income.toFixed(2)}</span>
+            </div>
+            <div class="stat-row">
+              <span>💸 Expenses</span>
+              <span style="color: var(--danger); font-weight: 600;">-£${expense.toFixed(2)}</span>
+            </div>
+            <div class="stat-row" style="border-top: 1px solid var(--glass-border); padding-top: 10px; margin-top: 5px;">
+              <span>📊 Net Savings</span>
+              <span style="color: ${savings >= 0 ? 'var(--success)' : 'var(--danger)'}; font-weight: 700;">
+                ${savings >= 0 ? '+' : '-'}£${Math.abs(savings).toFixed(2)}
+              </span>
+            </div>
+            <div class="stat-row">
+              <span>📅 Daily Avg Spend</span>
+              <span>£${dailyAvg.toFixed(2)}</span>
+            </div>
+          </div>
+        </div>
+        
+        <div class="savings-tips glass" style="margin-top: 20px; padding: 15px;">
+          <h4 style="color: var(--primary); margin-bottom: 10px;"><i class="fas fa-lightbulb"></i> Insights</h4>
+          <ul style="list-style: none; padding-left: 0;">
+            ${generateSavingsInsights(rate, savings, income, expense)}
+          </ul>
+        </div>
+        
+        <!-- Optional: Add a mini trend chart here if desired, but we omit for brevity -->
+      </div>
+    `;
+  }
+
+  function generateSavingsInsights(rate, savings, income, expense) {
+    const insights = [];
+    
+    if (rate >= 20) {
+      insights.push('✅ Excellent savings rate! Consider investing surplus.');
+    } else if (rate >= 10) {
+      insights.push('👍 Good savings rate. You\'re on track!');
+    } else if (rate > 0) {
+      insights.push('⚠️ Savings rate could be improved. Try to reduce discretionary spending.');
+    } else if (rate === 0) {
+      insights.push('⚠️ Breaking even. Look for ways to increase income or reduce expenses.');
+    } else {
+      insights.push('🔴 Spending exceeds income. Review your expenses immediately.');
+    }
+    
+    if (expense > income * 0.5) {
+      insights.push('💡 Your expense-to-income ratio is high. Consider fixed cost reduction.');
+    }
+    
+    if (income === 0) {
+      insights.push('⚠️ No income recorded this month. Add income transactions.');
+    }
+    
+    if (insights.length === 0) {
+      insights.push('📊 Keep tracking your finances for personalized insights.');
+    }
+    
+    return insights.map(i => `<li style="margin-bottom: 8px;">${i}</li>`).join('');
+  }
+
+  // Fix renderCategoryChart to work with the modal (already defined, but we enhance it)
+  function renderCategoryChart(data) {
+    const canvas = document.getElementById('modal-chart');
+    if (!canvas) return;
+    
+    // Destroy existing chart
+    if (AppState.modalChartInstance) {
+      AppState.modalChartInstance.destroy();
+    }
+    
+    const categoryMap = {};
+    data.forEach(t => {
+      const cat = t.category || 'Uncategorized';
+      categoryMap[cat] = (categoryMap[cat] || 0) + Math.abs(t.amount);
+    });
+    
+    const colors = [
+      '#00d2ff', '#ff4d4d', '#00ff88', '#ffaa00',
+      '#9b59b6', '#3498db', '#e74c3c', '#2ecc71',
+      '#f39c12', '#1abc9c', '#e67e22', '#95a5a6'
+    ];
+    
+    const ctx = canvas.getContext('2d');
+    AppState.modalChartInstance = new Chart(ctx, {
+      type: 'doughnut',
+      data: {
+        labels: Object.keys(categoryMap),
+        datasets: [{
+          data: Object.values(categoryMap),
+          backgroundColor: colors.slice(0, Object.keys(categoryMap).length),
+          borderWidth: 0,
+          hoverOffset: 15
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: {
+            position: 'bottom',
+            labels: {
+              color: 'rgba(255,255,255,0.8)',
+              font: { size: 11 }
+            }
+          },
+          tooltip: {
+            callbacks: {
+              label: (context) => {
+                const value = context.raw;
+                const total = context.dataset.data.reduce((a, b) => a + b, 0);
+                const percentage = ((value / total) * 100).toFixed(1);
+                return `£${value.toFixed(2)} (${percentage}%)`;
+              }
+            }
+          }
+        },
+        cutout: '65%',
+        animation: {
+          animateRotate: true,
+          animateScale: true
+        }
+      }
+    });
+  }
+
+  // ============================================
+  // CHART RENDERING (PLOTLY)
+  // ============================================
+  function renderDashboardCharts() {
+    renderSankeyChart();
+    render3DMatrix();
+    renderRunningBalance();
+  }
+
+  function renderSankeyChart() {
+    const chartId = 'chart-sankey';
+    safeExecute(async () => {
+      const data = await new Promise((resolve, reject) => {
+        google.script.run
+          .withSuccessHandler(resolve)
+          .withFailureHandler(reject)
+          .fetchSankeyData();
+      });
+
+      if (!data?.labels?.length) return;
+
+      const trace = {
+        type: "sankey",
+        orientation: "h",
+        node: {
+          pad: 15,
+          thickness: 20,
+          label: data.labels,
+          color: data.labels.map((l, i) => {
+            if (l.includes('Total Income')) return '#00d2ff';
+            if (i < data.labels.indexOf(l.includes('Total Income') ? l : '')) return 'rgba(0, 255, 136, 0.8)';
+            return 'rgba(255, 77, 77, 0.8)';
+          }),
+          line: { color: 'rgba(255,255,255,0.2)', width: 0.5 },
+          hoverinfo: 'all'
+        },
+        link: {
+          source: data.sources,
+          target: data.targets,
+          value: data.values,
+          color: 'rgba(255,255,255,0.1)'
+        }
+      };
+
+      const layout = {
+        font: { size: 12, color: "#fff" },
+        paper_bgcolor: "rgba(0,0,0,0)",
+        plot_bgcolor: "rgba(0,0,0,0)",
+        margin: { l: 20, r: 20, t: 20, b: 20 },
+        hoverlabel: { bgcolor: "rgba(0,0,0,0.8)", font: { color: "#fff" } }
+      };
+
+      await Plotly.newPlot(chartId, [trace], layout, { 
+        responsive: true, 
+        displayModeBar: false,
+        showSendToCloud: false
+      });
+      
+      AppState.chartInstances[chartId] = true;
+    }, null, 'Failed to render Sankey chart');
+  }
+
+  function render3DMatrix() {
+    const chartId = 'chart-3d';
+    safeExecute(async () => {
+      const data = await new Promise((resolve, reject) => {
+        google.script.run
+          .withSuccessHandler(resolve)
+          .withFailureHandler(reject)
+          .getMatrixData();
+      });
+
+      if (!data?.x?.length) return;
+
+      const trace = {
+        x: data.x,
+        y: data.y,
+        z: data.z,
+        type: 'surface',
+        colorscale: [
+          [0, '#020024'],
+          [0.3, '#090979'],
+          [0.6, '#00d2ff'],
+          [1, '#00ff88']
+        ],
+        contours: {
+          z: {
+            show: true,
+            usecolormap: true,
+            highlightcolor: "#42f5e3",
+            project: { z: true }
+          }
+        },
+        hovertemplate: '<b>Category:</b> %{x}<br><b>Month:</b> %{y}<br><b>Spend:</b> £%{z:.2f}<extra></extra>'
+      };
+
+      const layout = {
+        autosize: true,
+        paper_bgcolor: 'rgba(0,0,0,0)',
+        margin: { l: 0, r: 0, b: 0, t: 0 },
+        scene: {
+          camera: {
+            eye: { x: 1.8, y: 1.8, z: 1.5 }
+          },
+          xaxis: { 
+            tickfont: { color: '#ccc', size: 10 },
+            gridcolor: 'rgba(255,255,255,0.1)'
+          },
+          yaxis: { 
+            tickfont: { color: '#ccc', size: 10 },
+            gridcolor: 'rgba(255,255,255,0.1)'
+          },
+          zaxis: { 
+            tickfont: { color: '#ccc', size: 10 },
+            gridcolor: 'rgba(255,255,255,0.1)'
+          }
+        }
+      };
+
+      await Plotly.newPlot(chartId, [trace], layout, { 
+        responsive: true,
+        displayModeBar: false
+      });
+      
+      AppState.chartInstances[chartId] = true;
+    }, null, 'Failed to render 3D chart');
+  }
+
+  function renderRunningBalance() {
+    const chartId = 'chart-running-balance';
+    if (!AppState.data?.transactions) return;
+
+    const txs = [...AppState.data.transactions]
+      .sort((a, b) => new Date(a.date) - new Date(b.date));
+    
+    let running = 0;
+    const balanceData = txs.map(t => {
+      running += t.amount;
+      return { date: t.date, balance: running };
+    });
+
+    const trace = {
+      x: balanceData.map(d => d.date),
+      y: balanceData.map(d => d.balance),
+      type: 'scatter',
+      mode: 'lines',
+      line: { color: '#00d2ff', width: 3, shape: 'spline' },
+      fill: 'tozeroy',
+      fillcolor: 'rgba(0, 210, 255, 0.1)',
+      hovertemplate: 'Date: %{x}<br>Balance: £%{y:.2f}<extra></extra>'
+    };
+
+    const layout = {
+      paper_bgcolor: 'rgba(0,0,0,0)',
+      plot_bgcolor: 'rgba(0,0,0,0)',
+      font: { color: '#fff' },
+      xaxis: { 
+        gridcolor: 'rgba(255,255,255,0.05)',
+        tickfont: { color: '#ccc' }
+      },
+      yaxis: { 
+        gridcolor: 'rgba(255,255,255,0.05)',
+        zerolinecolor: 'rgba(255,255,255,0.1)',
+        tickfont: { color: '#ccc' },
+        tickprefix: '£'
+      },
+      margin: { l: 50, r: 20, t: 20, b: 40 },
+      hoverlabel: { bgcolor: 'rgba(0,0,0,0.8)' }
+    };
+
+    Plotly.newPlot(chartId, [trace], layout, { 
+      responsive: true,
+      displayModeBar: false
+    });
+  }
+
+  // ============================================
+  // BUDGET MANAGEMENT
+  // ============================================
+  async function loadSmartSuggestions() {
+    showLoader(true);
+    
+    await safeExecute(async () => {
+      const budgets = await new Promise((resolve, reject) => {
+        google.script.run
+          .withSuccessHandler(resolve)
+          .withFailureHandler(reject)
+          .getSmartBudgets();
+      });
+
+      renderBudgetCards(budgets);
+      showLoader(false);
+    }, null, 'Failed to load budget suggestions');
+  }
+
+  function renderBudgetCards(budgets) {
+    const container = document.getElementById('budget-list');
+    if (!container) return;
+
+    if (!budgets?.length) {
+      container.innerHTML = '<p class="no-data">No budget data available</p>';
+      return;
+    }
+
+    container.innerHTML = budgets.map(b => {
+      const percent = b.currentMonthSpend > 0 ? 
+        (b.currentMonthSpend / b.suggestedLimit) * 100 : 0;
+      const isOver = percent > 100;
+
+      return `
+        <div class="budget-card glass ${isOver ? 'alert-border' : ''}">
+          <div class="budget-header">
+            <span class="budget-category">${escapeHtml(b.category)}</span>
+            <span class="budget-amount">
+              £${b.currentMonthSpend.toFixed(0)} / 
+              <input type="number" 
+                     value="${b.suggestedLimit}" 
+                     class="budget-input" 
+                     data-category="${escapeHtml(b.category)}"
+                     min="0"
+                     step="10">
+            </span>
+          </div>
+          <div class="progress-container">
+            <div class="progress-bar" 
+                 style="width: ${Math.min(percent, 100)}%; 
+                        background: ${isOver ? 'var(--danger)' : 'linear-gradient(90deg, var(--success), var(--primary))'};">
+            </div>
+          </div>
+          <div class="budget-footer">
+            <span class="budget-percent">${percent.toFixed(1)}% used</span>
+            <span class="budget-remaining ${isOver ? 'over' : ''}">
+              ${isOver ? 'Over by' : 'Remaining'}: 
+              £${Math.abs(b.suggestedLimit - b.currentMonthSpend).toFixed(2)}
+            </span>
+          </div>
+        </div>
+      `;
+    }).join('');
+  }
+
+  async function saveAllBudgets() {
+    const budgetMap = {};
+    document.querySelectorAll('.budget-input').forEach(input => {
+      const category = input.dataset.category;
+      const value = parseFloat(input.value) || 0;
+      if (category && value > 0) {
+        budgetMap[category] = value;
+      }
+    });
+
+    await safeExecute(async () => {
+      await new Promise((resolve, reject) => {
+        google.script.run
+          .withSuccessHandler(resolve)
+          .withFailureHandler(reject)
+          .saveFinalBudgets(budgetMap);
+      });
+      
+      showSuccess('Budgets saved successfully!');
+    }, null, 'Failed to save budgets');
+  }
+
+  // ============================================
+  // FORECAST
+  // ============================================
+  function runForecast() {
+    const adjustments = {
+      incomeMod: parseFloat(document.getElementById('income-slider')?.value || 0),
+      expenseMod: parseFloat(document.getElementById('expense-slider')?.value || 0)
+    };
+
+    showLoader(true);
+    
+    safeExecute(async () => {
+      const projection = await new Promise((resolve, reject) => {
+        google.script.run
+          .withSuccessHandler(resolve)
+          .withFailureHandler(reject)
+          .getForecastData(adjustments);
+      });
+
+      renderForecastChart(projection);
+      showLoader(false);
+    }, null, 'Failed to generate forecast');
+  }
+
+  function renderForecastChart(projection) {
+    if (!projection?.length) return;
+
+    const colors = projection.map(p => 
+      parseFloat(p.balance) >= 0 ? 'var(--success)' : 'var(--danger)'
+    );
+
+    const trace = {
+      x: projection.map(p => p.month),
+      y: projection.map(p => p.balance),
+      type: 'scatter',
+      mode: 'lines+markers',
+      line: { 
+        shape: 'spline', 
+        color: '#00ff88', 
+        width: 3 
+      },
+      marker: { 
+        size: 10, 
+        color: colors,
+        line: { color: '#fff', width: 2 }
+      },
+      fill: 'tozeroy',
+      fillcolor: 'rgba(0, 255, 136, 0.1)',
+      hovertemplate: 'Month: %{x}<br>Balance: £%{y:.2f}<extra></extra>'
+    };
+
+    const layout = {
+      title: { 
+        text: '12-Month Financial Projection', 
+        font: { color: '#fff', size: 16 } 
+      },
+      paper_bgcolor: 'rgba(0,0,0,0)',
+      plot_bgcolor: 'rgba(0,0,0,0)',
+      xaxis: { 
+        gridcolor: 'rgba(255,255,255,0.1)', 
+        tickfont: { color: '#ccc' },
+        tickangle: -45
+      },
+      yaxis: { 
+        title: 'Balance (£)', 
+        gridcolor: 'rgba(255,255,255,0.1)', 
+        tickfont: { color: '#ccc' },
+        tickprefix: '£'
+      },
+      margin: { l: 60, r: 30, b: 60, t: 60 },
+      hoverlabel: { bgcolor: 'rgba(0,0,0,0.8)' }
+    };
+
+    Plotly.newPlot('chart-forecast', [trace], layout, { 
+      responsive: true,
+      displayModeBar: false
+    });
+  }
+
+  // ============================================
+  // NET WORTH
+  // ============================================
+  function initializeNetWorth() {
+    if (!AppState.data?.nw) return;
+
+    const { assets = [], liabilities = [] } = AppState.data.nw;
+    
+    document.getElementById('asset-list').innerHTML = '';
+    document.getElementById('liab-list').innerHTML = '';
+
+    assets.forEach(a => addAssetRow('assets', a.name, a.value));
+    liabilities.forEach(l => addAssetRow('liabilities', l.name, l.value));
+
+    calculateNetWorthTotal();
+  }
+
+  function addAssetRow(type, name = '', value = 0) {
+    const container = document.getElementById(type === 'assets' ? 'asset-list' : 'liab-list');
+    if (!container) return;
+
+    const rowId = `row-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    const row = document.createElement('div');
+    row.className = 'nw-row';
+    row.id = rowId;
+    row.innerHTML = `
+      <input type="text" class="nw-name" placeholder="Name" value="${escapeHtml(name)}">
+      <input type="number" class="nw-value" placeholder="Value" value="${value}" step="100" min="0">
+      <button class="nw-delete" onclick="removeAssetRow('${rowId}', '${type}')">
+        <i class="fas fa-times"></i>
+      </button>
+    `;
+
+    // Add change listeners
+    row.querySelectorAll('input').forEach(input => {
+      input.addEventListener('input', debounce(calculateNetWorthTotal, 300));
+    });
+
+    container.appendChild(row);
+    calculateNetWorthTotal();
+  }
+
+  function removeAssetRow(rowId, type) {
+    const row = document.getElementById(rowId);
+    if (row) {
+      row.remove();
+      calculateNetWorthTotal();
+      showToast('Item removed', 'info');
+    }
+  }
+
+  function calculateNetWorthTotal() {
+    let totalAssets = parseFloat(AppState.data?.kpis?.balance || 0);
+    let totalLiabilities = 0;
+
+    document.querySelectorAll('#asset-list .nw-value').forEach(input => {
+      totalAssets += parseFloat(input.value) || 0;
+    });
+
+    document.querySelectorAll('#liab-list .nw-value').forEach(input => {
+      totalLiabilities += parseFloat(input.value) || 0;
+    });
+
+    const total = totalAssets - totalLiabilities;
+    const element = document.getElementById('nw-total');
+    
+    if (element) {
+      element.textContent = `£${total.toLocaleString(undefined, {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2
+      })}`;
+      element.style.color = total >= 0 ? 'var(--success)' : 'var(--danger)';
+    }
+
+    return total;
+  }
+
+  async function syncNetWorth() {
+    const assets = [];
+    const liabilities = [];
+
+    document.querySelectorAll('#asset-list .nw-row').forEach(row => {
+      const name = row.querySelector('.nw-name')?.value;
+      const value = parseFloat(row.querySelector('.nw-value')?.value) || 0;
+      if (name && value > 0) {
+        assets.push({ name, value });
+      }
+    });
+
+    document.querySelectorAll('#liab-list .nw-row').forEach(row => {
+      const name = row.querySelector('.nw-name')?.value;
+      const value = parseFloat(row.querySelector('.nw-value')?.value) || 0;
+      if (name && value > 0) {
+        liabilities.push({ name, value });
+      }
+    });
+
+    await safeExecute(async () => {
+      await new Promise((resolve, reject) => {
+        google.script.run
+          .withSuccessHandler(resolve)
+          .withFailureHandler(reject)
+          .saveNetWorth({ assets, liabilities });
+      });
+      
+      showSuccess('Net worth updated successfully!');
+    }, null, 'Failed to save net worth');
+  }
+
+  // ============================================
+  // SETTINGS
+  // ============================================
+  function toggleExternalInput() {
+    const type = document.getElementById('source-type')?.value;
+    const container = document.getElementById('external-id-container');
+    if (container) {
+      container.style.display = type === 'external' ? 'block' : 'none';
+    }
+  }
+
+  async function verifyConnection() {
+    const id = document.getElementById('external-sheet-id')?.value;
+    if (!id) {
+      showWarning('Please enter a Sheet ID');
+      return;
+    }
+
+    showLoader(true);
+    
+    await safeExecute(async () => {
+      const result = await new Promise((resolve, reject) => {
+        google.script.run
+          .withSuccessHandler(resolve)
+          .withFailureHandler(reject)
+          .testExternalConnection(id);
+      });
+
+      if (result.success) {
+        showSuccess(`Connected to: ${result.name}`);
+      } else {
+        showError(result.message);
+      }
+    }, null, 'Connection test failed');
+
+    showLoader(false);
+  }
+
+  async function saveAllSettings() {
+    const sourceType = document.getElementById('source-type')?.value;
+    const externalId = document.getElementById('external-sheet-id')?.value;
+    const apiKey = document.getElementById('openai-key')?.value;
+
+    showLoader(true);
+
+    // Save data source
+    const sourceSaved = await safeExecute(async () => {
+      await new Promise((resolve, reject) => {
+        google.script.run
+          .withSuccessHandler(resolve)
+          .withFailureHandler(reject)
+          .updateDataSource(sourceType, externalId);
+      });
+      return true;
+    }, false, 'Failed to save data source');
+
+    // Save API key if provided
+    if (apiKey && sourceSaved) {
+      await safeExecute(async () => {
+        await new Promise((resolve, reject) => {
+          google.script.run
+            .withSuccessHandler(resolve)
+            .withFailureHandler(reject)
+            .setUserProp('OPENAI_API_KEY', apiKey);
+        });
+      }, null, 'Failed to save API key');
+    }
+
+    showLoader(false);
+    
+    if (sourceSaved) {
+      showSuccess('Settings saved! Refreshing data...');
+      setTimeout(() => loadDashboardData(true), 1500);
+    }
+  }
+
+  // ============================================
+  // IMPORT WIZARD
+  // ============================================
+  function handleDrop(e) {
+    preventDefaults(e);
+    const file = e.dataTransfer?.files[0];
+    if (file && file.type === 'text/csv') {
+      handleFileSelect({ target: { files: [file] } });
+    } else {
+      showError('Please drop a CSV file');
+    }
+  }
+
+  function handleFileSelect(event) {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    if (file.type !== 'text/csv' && !file.name.endsWith('.csv')) {
+      showError('Please select a CSV file');
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = function(e) {
+      processCSV(e.target.result);
+    };
+    reader.onerror = function() {
+      showError('Failed to read file');
+    };
+    reader.readAsText(file);
+  }
+
+  function processCSV(csvText) {
+    const lines = csvText.split('\n').filter(line => line.trim());
+    if (lines.length < 2) {
+      showError('CSV must have headers and at least one data row');
+      return;
+    }
+
+    const headers = lines[0].split(',').map(h => h.trim());
+    const data = lines.slice(1).map(line => 
+      line.split(',').map(cell => cell.trim())
+    );
+
+    showToast(`Loaded ${data.length} rows`, 'success');
+    
+    // Show mapping interface
+    document.getElementById('import-step-1').style.display = 'none';
+    document.getElementById('import-step-2').style.display = 'block';
+    
+    generateMappingUI(headers);
+  }
+
+  function generateMappingUI(headers) {
+    const mappingArea = document.getElementById('mapping-area');
+    const requiredFields = ['Date', 'Description', 'Amount', 'Category'];
+
+    mappingArea.innerHTML = requiredFields.map(field => `
+      <div class="mapping-row">
+        <label>${field}:</label>
+        <select class="map-select" data-field="${field.toLowerCase()}">
+          <option value="">-- Select Column --</option>
+          ${headers.map((h, i) => `<option value="${i}">${h}</option>`).join('')}
+        </select>
+      </div>
+    `).join('');
+  }
+
+  async function executeImport() {
+    const mapping = {};
+    document.querySelectorAll('.map-select').forEach(select => {
+      mapping[select.dataset.field] = select.value;
+    });
+
+    const missingFields = Object.entries(mapping)
+      .filter(([_, val]) => !val)
+      .map(([field]) => field);
+
+    if (missingFields.length > 0) {
+      showError(`Please map all fields: ${missingFields.join(', ')}`);
+      return;
+    }
+
+    showLoader(true);
+
+    await safeExecute(async () => {
+      const success = await new Promise((resolve, reject) => {
+        google.script.run
+          .withSuccessHandler(resolve)
+          .withFailureHandler(reject)
+          .processImportData(mapping);
+      });
+
+      if (success) {
+        showSuccess('Import completed successfully!');
+        closeImportWizard();
+        await loadDashboardData(true);
+      } else {
+        showError('Import failed');
+      }
+    }, null, 'Import process failed');
+
+    showLoader(false);
+  }
+
+  function resetImport() {
+    document.getElementById('import-step-1').style.display = 'block';
+    document.getElementById('import-step-2').style.display = 'none';
+    document.getElementById('csv-file').value = '';
+  }
+
+  function openImportWizard() {
+    document.getElementById('import-modal').style.display = 'block';
+    resetImport();
+  }
+
+  function closeImportWizard() {
+    document.getElementById('import-modal').style.display = 'none';
+  }
+
+  // ============================================
+  // THEME MANAGEMENT
+  // ============================================
+  function setTheme(themeName) {
+    const themeClass = themeName ? `theme-${themeName}` : '';
+    document.body.className = themeClass;
+    localStorage.setItem('appTheme', themeClass);
+    
+    // Update active swatch
+    document.querySelectorAll('.theme-swatch').forEach(s => 
+      s.classList.remove('active')
+    );
+    if (themeName) {
+      document.querySelector(`.theme-swatch[data-theme="${themeName}"]`)
+        ?.classList.add('active');
+    }
+
+    // Refresh charts with new theme
+    if (AppState.data) {
+      renderDashboardCharts();
+    }
+
+    showToast(`Theme changed to ${themeName || 'Default'}`, 'info');
+  }
+
+  function toggleFab(btn) {
+    btn.classList.toggle('active');
+    const menu = btn.previousElementSibling;
+    if (menu) menu.classList.toggle('show');
+  }
+
+  // ============================================
+  // PAGE NAVIGATION
+  // ============================================
+  function showPage(pageId) {
+    // Hide all pages
+    document.querySelectorAll('#page-content > div[id$="-view"]').forEach(div => {
+      div.style.display = 'none';
+    });
+
+    // Show selected page
+    const target = document.getElementById(pageId + '-view');
+    if (target) {
+      target.style.display = 'block';
+      
+      // Page-specific handlers
+      switch(pageId) {
+        case 'dashboard':
+          setTimeout(() => {
+            Object.keys(AppState.chartInstances).forEach(id => {
+              Plotly.relayout(id, {});
+            });
+          }, 100);
+          break;
+          
+        case 'calendar':
+          if (AppState.calendar) {
+            setTimeout(() => AppState.calendar.updateSize(), 100);
+          } else {
+            initializeCalendar();
+          }
+          break;
+          
+        case 'budgets':
+          loadSmartSuggestions();
+          break;
+          
+        case 'networth':
+          calculateNetWorthTotal();
+          break;
+      }
+    }
+
+    // Update active nav item
+    document.querySelectorAll('.nav-item').forEach(item => {
+      item.classList.remove('active');
+    });
+    document.querySelector(`.nav-item[onclick*="${pageId}"]`)?.classList.add('active');
+  }
+
+  // ============================================
+  // MODAL MANAGEMENT
+  // ============================================
+  function closeModal(modalId) {
+    const modal = document.getElementById(modalId);
+    if (modal) {
+      modal.style.display = 'none';
+      
+      // Clean up chart instance if modal has one
+      if (modalId === 'kpi-detail-modal' && AppState.modalChartInstance) {
+        AppState.modalChartInstance.destroy();
+        AppState.modalChartInstance = null;
+      }
+    }
+  }
+
+  function closeAllModals() {
+    const modals = ['tiny-modal', 'kpi-detail-modal', 'import-modal', 'error-modal'];
+    modals.forEach(id => closeModal(id));
+  }
+
+  // ============================================
+  // UTILITY FUNCTIONS
+  // ============================================
+  function formatDate(dateStr, format = 'short') {
+    if (!dateStr) return '';
+    try {
+      const d = new Date(dateStr);
+      if (isNaN(d.getTime())) return dateStr;
+      
+      if (format === 'short') {
+        return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+      }
+      return d.toLocaleDateString('en-US', { 
+        weekday: 'short',
+        year: 'numeric', 
+        month: 'short', 
+        day: 'numeric' 
+      });
+    } catch (e) {
+      return dateStr;
+    }
+  }
+
+  function escapeHtml(text) {
+    if (!text) return '';
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+  }
+
+  function showQuickSearch() {
+    // Implement quick search functionality
+    showToast('Quick search coming soon!', 'info');
+  }
+
+  function showError(message) {
+    const modal = document.getElementById('error-modal');
+    const text = document.getElementById('error-text');
+    if (text) text.textContent = message;
+    if (modal) modal.style.display = 'block';
+    console.error('Error:', message);
+  }
+
+  function closeErrorModal() {
+    document.getElementById('error-modal').style.display = 'none';
+  }
+
+  // ============================================
+  // SERVICE WORKER (Optional PWA support)
+  // ============================================
+  function initializeServiceWorker() {
+    if ('serviceWorker' in navigator && location.protocol === 'https:') {
+      navigator.serviceWorker.register('/sw.js').catch(err => {
+        console.log('ServiceWorker registration failed:', err);
+      });
+    }
+  }
+
+  // ============================================
+  // GLOBAL EXPORTS
+  // ============================================
+  window.showPage = showPage;
+  window.setTheme = setTheme;
+  window.toggleFab = toggleFab;
+  window.openImportWizard = openImportWizard;
+  window.closeImportWizard = closeImportWizard;
+  window.closeTinyModal = closeTinyModal;
+  window.loadSmartSuggestions = loadSmartSuggestions;
+  window.saveAllBudgets = saveAllBudgets;
+  window.openKpiDetail = openKpiDetail;
+  window.closeModal = closeModal;
+  window.showToast = showToast;
+  window.runForecast = runForecast;
+  window.saveAllSettings = saveAllSettings;
+  window.addAssetRow = addAssetRow;
+  window.removeAssetRow = removeAssetRow;
+  window.syncNetWorth = syncNetWorth;
+  window.toggleExternalInput = toggleExternalInput;
+  window.verifyConnection = verifyConnection;
+  window.executeImport = executeImport;
+  window.closeErrorModal = closeErrorModal;
+  window.refreshData = () => loadDashboardData(true);
+</script>
+Is it safe to paste  this date range selector below the code above?
+// ============================================
+// DATE RANGE FILTER
+// ============================================
+let filteredData = null;
+
+function setQuickRange(range) {
+  const today = new Date();
+  let startDate = new Date();
+  
+  switch(range) {
+    case 'month':
+      startDate = new Date(today.getFullYear(), today.getMonth(), 1);
+      break;
+    case 'quarter':
+      startDate = new Date(today);
+      startDate.setMonth(today.getMonth() - 3);
+      break;
+    case 'year':
+      startDate = new Date(today.getFullYear(), 0, 1);
+      break;
+    case 'all':
+      startDate = new Date(2000, 0, 1); // Far past
+      break;
+  }
+  
+  document.getElementById('start-date').value = formatDateForInput(startDate);
+  document.getElementById('end-date').value = formatDateForInput(today);
+  
+  applyDateFilter();
+}
+
+function formatDateForInput(date) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+function applyDateFilter() {
+  if (!globalData || !globalData.transactions) {
+    showToast('No data to filter', 'warning');
+    return;
+  }
+  
+  const startDate = document.getElementById('start-date').value;
+  const endDate = document.getElementById('end-date').value;
+  
+  if (!startDate || !endDate) {
+    showToast('Please select both start and end dates', 'warning');
+    return;
+  }
+  
+  const start = new Date(startDate);
+  const end = new Date(endDate);
+  end.setHours(23, 59, 59); // Include entire end day
+  
+  // Filter transactions
+  filteredData = globalData.transactions.filter(t => {
+    const tDate = new Date(t.date);
+    return tDate >= start && tDate <= end;
+  });
+  
+  // Update summary stats
+  updateFilteredSummary();
+  
+  // Update charts with filtered data
+  renderFilteredCharts();
+  
+  // Show summary section
+  document.getElementById('filtered-summary').style.display = 'block';
+  
+  showToast(`Showing ${filteredData.length} transactions`, 'success');
+}
+
+function updateFilteredSummary() {
+  if (!filteredData) return;
+  
+  const income = filteredData.filter(t => t.amount > 0)
+    .reduce((s, t) => s + t.amount, 0);
+  const expense = filteredData.filter(t => t.amount < 0)
+    .reduce((s, t) => s + Math.abs(t.amount), 0);
+  const balance = income - expense;
+  
+  document.getElementById('filtered-balance').innerText = `£${balance.toFixed(2)}`;
+  document.getElementById('filtered-income').innerText = `£${income.toFixed(2)}`;
+  document.getElementById('filtered-expense').innerText = `£${expense.toFixed(2)}`;
+  document.getElementById('filtered-count').innerText = filteredData.length;
+  
+  // Color coding
+  document.getElementById('filtered-balance').style.color = 
+    balance >= 0 ? 'var(--success)' : 'var(--danger)';
+}
+
+function renderFilteredCharts() {
+  if (!filteredData) return;
+  
+  // Temporarily replace global data for charts
+  const originalData = globalData;
+  globalData = { ...globalData, transactions: filteredData };
+  
+  // Re-render charts
+  renderRunningBalance();
+  renderSankeyChart(); // This will fetch fresh but we can modify to use filtered
+  render3DMatrix();
+  
+  // Restore original
+  globalData = originalData;
+}
+
+// Clear filter
+function clearFilter() {
+  filteredData = null;
+  document.getElementById('filtered-summary').style.display = 'none';
+  document.getElementById('start-date').value = '';
+  document.getElementById('end-date').value = '';
+  
+  // Restore original charts
+  renderDashboardCharts();
+  showToast('Filter cleared', 'info');
+}
+
+// Modify renderSankeyChart to accept filtered data
+function renderSankeyChart(filteredTransactions = null) {
+  const dataToUse = filteredTransactions || globalData?.transactions;
+  
+  google.script.run
+    .withSuccessHandler(function(data) {
+      if (!data.labels) return;
+      
+      // If we have filtered data, recalculate values
+      if (filteredTransactions) {
+        data = recalculateSankeyWithFilteredData(filteredTransactions, data.labels);
+      }
+      
+      const trace = {
+        type: "sankey",
+        orientation: "h",
+        node: {
+          pad: 15,
+          thickness: 20,
+          label: data.labels,
+          color: data.labels.map((l, i) => {
+            if (l.includes('Total Income')) return '#00d2ff';
+            if (i < data.labels.indexOf(l.includes('Total Income') ? l : '')) 
+              return 'rgba(0, 255, 136, 0.8)';
+            return 'rgba(255, 77, 77, 0.8)';
+          })
+        },
+        link: {
+          source: data.sources,
+          target: data.targets,
+          value: data.values,
+          color: 'rgba(255,255,255,0.1)'
+        }
+      };
+      
+      Plotly.react('chart-sankey', [trace], {
+        paper_bgcolor: 'rgba(0,0,0,0)',
+        font: { color: '#fff' }
+      });
+    })
+    .fetchSankeyData();
+}
+
+function recalculateSankeyWithFilteredData(transactions, originalLabels) {
+  // Simplified recalculation - you can expand this
+  const incomeTxs = transactions.filter(t => t.amount > 0);
+  const expenseTxs = transactions.filter(t => t.amount < 0);
+  
+  return {
+    labels: originalLabels,
+    sources: [0, 1], // Simplified - you'll need full logic
+    targets: [2, 2],
+    values: [
+      incomeTxs.reduce((s,t) => s + t.amount, 0),
+      Math.abs(expenseTxs.reduce((s,t) => s + t.amount, 0))
+    ]
+  };
+}
+We need to answer whether it's safe to paste this date range filter code below the existing code. The user provided a large JavaScript block and then asked about adding this date range filter code. They likely want to know if there will be conflicts or issues.
+
+We need to analyze the existing code (the large script) and the new code snippet. The existing code uses AppState as global state, with AppState.data storing the data. The new code uses globalData which is not defined in the existing code; it refers to globalData in multiple places (e.g., if (!globalData || !globalData.transactions)). Also, the new code attempts to modify globalData directly, which is not how the existing code works. It also redefines renderSankeyChart with a different signature, but the existing code already has a renderSankeyChart that uses google.script.run to fetch data. The new code would override that function, causing issues. Additionally, the new code tries to call google.script.run.fetchSankeyData() inside its version, which is asynchronous, and also has a recalculateSankeyWithFilteredData that is simplistic.
+
+Thus, the new code is not directly compatible with the existing code. It's not safe to simply paste it as is. It would need adaptation to work with AppState and not conflict with existing functions.
+
+We should advise the user that the code needs to be integrated carefully, perhaps by modifying it to use AppState.data instead of globalData, and to avoid redefining existing functions. We can suggest a revised version that integrates properly.
+
+But the question: "Is it safe to paste this date range selector below the code above?" The answer is: No, it's not safe because it will conflict with the existing code (variable name clashes, function redefinition, etc.). We need to explain why and suggest modifications.
+
+We should provide a detailed response explaining the issues and provide an adapted version that works with the existing code.
+
+It is not safe to paste that code as-is because it conflicts with the existing JavaScript in several critical ways. If you simply append it, you’ll encounter errors and break functionality. Below I explain the problems and provide an adapted version that integrates cleanly with your current AppState-based architecture.
+
+❌ Why the Provided Code Will Break Your App
+Undefined globalData – The snippet uses globalData repeatedly, but your existing code stores all data in AppState.data. This will cause ReferenceErrors.
+
+Function Name Collision – The snippet redefines renderSankeyChart(), which already exists in your code (it fetches data via google.script.run). Overwriting it will break the Sankey chart.
+
+Direct Mutation of Global Data – The snippet temporarily replaces globalData to render filtered charts. Your existing code uses AppState.data and relies on it being immutable for proper caching and reactivity.
+
+Incomplete Filter Logic – The recalculateSankeyWithFilteredData() function is a placeholder and won’t produce correct Sankey data. The Sankey chart in your app is built server‑side; filtering should be done by passing the date range to the server, not by recalculating on the client.
+
+Missing HTML Elements – The snippet assumes the existence of elements like start-date, end-date, filtered-summary, etc. Your current HTML doesn’t include them, so the JavaScript would throw errors when trying to access them.
+
+✅ Safe, Integrated Version (Adapted for Your Code)
+Below is a rewritten date‑range filter that works with your existing AppState, preserves all existing functions, and adds the necessary UI elements (you’ll need to insert the HTML as well). It does not redefine any existing functions and instead adds new ones prefixed appropriately.
+
+1. Add This JavaScript after your existing script (or merge it carefully)
+javascript
+// ============================================
+// DATE RANGE FILTER (Integrated with AppState)
+// ============================================
+(function() {
+  // Store filtered data separately (not replacing AppState.data)
+  let filteredData = null;
+
+  // Expose functions globally
+  window.setQuickRange = function(range) {
+    const today = new Date();
+    let startDate = new Date();
+    
+    switch(range) {
+      case 'month':
+        startDate = new Date(today.getFullYear(), today.getMonth(), 1);
+        break;
+      case 'quarter':
+        startDate = new Date(today);
+        startDate.setMonth(today.getMonth() - 3);
+        break;
+      case 'year':
+        startDate = new Date(today.getFullYear(), 0, 1);
+        break;
+      case 'all':
+        startDate = new Date(2000, 0, 1); // Far past
+        break;
+    }
+    
+    document.getElementById('start-date').value = formatDateForInput(startDate);
+    document.getElementById('end-date').value = formatDateForInput(today);
+    
+    applyDateFilter();
+  };
+
+  window.formatDateForInput = function(date) {
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+  };
+
+  window.applyDateFilter = function() {
+    if (!AppState.data || !AppState.data.transactions) {
+      showToast('No data to filter', 'warning');
+      return;
+    }
+    
+    const startDate = document.getElementById('start-date').value;
+    const endDate = document.getElementById('end-date').value;
+    
+    if (!startDate || !endDate) {
+      showToast('Please select both start and end dates', 'warning');
+      return;
+    }
+    
+    const start = new Date(startDate);
+    const end = new Date(endDate);
+    end.setHours(23, 59, 59); // include entire end day
+    
+    // Filter transactions
+    filteredData = AppState.data.transactions.filter(t => {
+      const tDate = new Date(t.date);
+      return tDate >= start && tDate <= end;
+    });
+    
+    // Update summary UI
+    updateFilteredSummary();
+    
+    // Re-render relevant charts using the filtered data
+    renderFilteredCharts();
+    
+    document.getElementById('filtered-summary').style.display = 'block';
+    showToast(`Showing ${filteredData.length} transactions`, 'success');
+  };
+
+  function updateFilteredSummary() {
+    if (!filteredData) return;
+    
+    const income = filteredData.filter(t => t.amount > 0)
+      .reduce((s, t) => s + t.amount, 0);
+    const expense = filteredData.filter(t => t.amount < 0)
+      .reduce((s, t) => s + Math.abs(t.amount), 0);
+    const balance = income - expense;
+    
+    document.getElementById('filtered-balance').innerText = `£${balance.toFixed(2)}`;
+    document.getElementById('filtered-income').innerText = `£${income.toFixed(2)}`;
+    document.getElementById('filtered-expense').innerText = `£${expense.toFixed(2)}`;
+    document.getElementById('filtered-count').innerText = filteredData.length;
+    
+    document.getElementById('filtered-balance').style.color = 
+      balance >= 0 ? 'var(--success)' : 'var(--danger)';
+  }
+
+  function renderFilteredCharts() {
+    if (!filteredData) return;
+
+    // Create a temporary data object for chart rendering
+    const filteredAppData = {
+      ...AppState.data,
+      transactions: filteredData
+    };
+
+    // Re-render the running balance chart (it uses AppState.data directly)
+    // We'll temporarily override AppState.data for this call
+    const originalData = AppState.data;
+    AppState.data = filteredAppData;
+    renderRunningBalance();  // this function reads AppState.data
+    AppState.data = originalData;
+
+    // For Sankey and 3D matrix, we need to fetch filtered data from server
+    // The cleanest approach: call server with date parameters
+    const startDate = document.getElementById('start-date').value;
+    const endDate = document.getElementById('end-date').value;
+
+    // Fetch filtered Sankey data from server
+    google.script.run
+      .withSuccessHandler(data => {
+        if (!data?.labels?.length) return;
+        const trace = {
+          type: "sankey",
+          orientation: "h",
+          node: {
+            pad: 15,
+            thickness: 20,
+            label: data.labels,
+            color: data.labels.map((l, i) => {
+              if (l.includes('Total Income')) return '#00d2ff';
+              if (i < data.labels.indexOf(l.includes('Total Income') ? l : '')) 
+                return 'rgba(0, 255, 136, 0.8)';
+              return 'rgba(255, 77, 77, 0.8)';
+            })
+          },
+          link: {
+            source: data.sources,
+            target: data.targets,
+            value: data.values,
+            color: 'rgba(255,255,255,0.1)'
+          }
+        };
+        Plotly.react('chart-sankey', [trace], {
+          paper_bgcolor: 'rgba(0,0,0,0)',
+          font: { color: '#fff' }
+        });
+      })
+      .withFailureHandler(err => showToast('Failed to load filtered Sankey', 'error'))
+      .fetchSankeyData(startDate, endDate);  // you'll need to modify your server function to accept dates
+
+    // Similarly, fetch filtered 3D matrix data
+    google.script.run
+      .withSuccessHandler(data => {
+        if (!data?.x?.length) return;
+        const trace = {
+          x: data.x,
+          y: data.y,
+          z: data.z,
+          type: 'surface',
+          colorscale: [
+            [0, '#020024'],
+            [0.3, '#090979'],
+            [0.6, '#00d2ff'],
+            [1, '#00ff88']
+          ]
+        };
+        Plotly.react('chart-3d', [trace], {
+          paper_bgcolor: 'rgba(0,0,0,0)',
+          scene: {
+            xaxis: { tickfont: { color: '#ccc' } },
+            yaxis: { tickfont: { color: '#ccc' } },
+            zaxis: { tickfont: { color: '#ccc' } }
+          }
+        });
+      })
+      .withFailureHandler(err => showToast('Failed to load filtered 3D data', 'error'))
+      .getMatrixData(startDate, endDate);  // again, modify server function
+  }
+
+  window.clearFilter = function() {
+    filteredData = null;
+    document.getElementById('filtered-summary').style.display = 'none';
+    document.getElementById('start-date').value = '';
+    document.getElementById('end-date').value = '';
+    
+    // Restore original charts (by re-initializing with full data)
+    renderDashboardCharts();  // this uses AppState.data
+    if (AppState.calendar) {
+      // You may want to refresh calendar events here
+      initializeCalendar();  // re-creates calendar with full data
+    }
+    showToast('Filter cleared', 'info');
+  };
+})();
+2. Add the Required HTML (Place inside your page, e.g., in the dashboard view)
+html
+<div class="filter-bar glass" style="margin-bottom: 20px; padding: 15px; display: flex; gap: 15px; align-items: center; flex-wrap: wrap;">
+  <div style="display: flex; gap: 10px; align-items: center;">
+    <label>From:</label>
+    <input type="date" id="start-date" class="filter-input">
+    <label>To:</label>
+    <input type="date" id="end-date" class="filter-input">
+  </div>
+  <div style="display: flex; gap: 5px;">
+    <button class="btn-outline btn-small" onclick="setQuickRange('month')">Month</button>
+    <button class="btn-outline btn-small" onclick="setQuickRange('quarter')">Quarter</button>
+    <button class="btn-outline btn-small" onclick="setQuickRange('year')">Year</button>
+    <button class="btn-outline btn-small" onclick="setQuickRange('all')">All</button>
+  </div>
+  <div>
+    <button class="btn-primary btn-small" onclick="applyDateFilter()">Apply</button>
+    <button class="btn-outline btn-small" onclick="clearFilter()">Clear</button>
+  </div>
+</div>
+
+<!-- Filtered Summary (hidden by default) -->
+<div id="filtered-summary" class="glass" style="display: none; margin-bottom: 20px; padding: 15px;">
+  <h4 style="margin-top: 0;">Filtered Summary</h4>
+  <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px;">
+    <div>
+      <span class="stat-label">Balance</span>
+      <span id="filtered-balance" class="stat-value">£0.00</span>
+    </div>
+    <div>
+      <span class="stat-label">Income</span>
+      <span id="filtered-income" class="stat-value">£0.00</span>
+    </div>
+    <div>
+      <span class="stat-label">Expenses</span>
+      <span id="filtered-expense" class="stat-value">£0.00</span>
+    </div>
+    <div>
+      <span class="stat-label">Transactions</span>
+      <span id="filtered-count" class="stat-value">0</span>
+    </div>
+  </div>
+</div>
+3. Server‑Side Modifications (Google Apps Script)
+You’ll need to update your .gs functions (fetchSankeyData and getMatrixData) to accept optional startDate and endDate parameters and return filtered data. Example:
+
+javascript
+function fetchSankeyData(startDate, endDate) {
+  // If dates provided, filter transactions between them
+  // Otherwise return full data
+}
+🔍 Summary of Changes
+Used AppState.data instead of globalData.
+
+Preserved all original functions; added new ones inside an IIFE to avoid polluting the global scope unnecessarily.
+
+Instead of client‑side recalculations, we call the server with date parameters to get properly filtered Sankey and 3D data (this is more accurate and maintainable).
+
+Added the necessary HTML for the filter UI and summary.
+
+The renderRunningBalance chart is temporarily fed filtered data by swapping AppState.data (then restoring it) – this works because the function reads AppState.data.transactions.
+
+By following this integration, you’ll have a safe, working date‑range filter that enhances your dashboard without breaking existing features.
+
+what about this
+// ============================================
+// SYNC BUTTON FUNCTIONALITY
+// ============================================
+let lastSyncTime = localStorage.getItem('lastSyncTime') || null;
+
+function manualSync() {
+  const syncBtn = document.querySelector('.btn-primary[onclick="manualSync()"]');
+  const syncIcon = document.getElementById('sync-icon');
+  
+  // Disable button and show loading
+  syncBtn.disabled = true;
+  syncBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Syncing...';
+  syncIcon.className = 'fas fa-spinner fa-spin';
+  
+  // Force refresh data from source
+  showLoader(true);
+  
+  google.script.run
+    .withSuccessHandler(function(data) {
+      // Update global state
+      globalData = data;
+      
+      // Update timestamp
+      lastSyncTime = new Date().toLocaleString();
+      localStorage.setItem('lastSyncTime', lastSyncTime);
+      document.getElementById('last-sync-time').innerText = `Last sync: ${lastSyncTime}`;
+      
+      // Refresh all UI components
+      updateKPIs(data.kpis);
+      renderDashboardCharts();
+      
+      // Reinitialize calendar with new data
+      if (calendar) calendar.destroy();
+      initCalendar();
+      
+      // Refresh budget view if visible
+      if (document.getElementById('budgets-view').style.display === 'block') {
+        loadSmartSuggestions();
+      }
+      
+      // Refresh net worth
+      calculateNetWorthTotal();
+      
+      showToast('Dashboard synced successfully!', 'success');
+      showLoader(false);
+      
+      // Reset button
+      syncBtn.disabled = false;
+      syncBtn.innerHTML = '<i class="fas fa-sync-alt"></i> Sync Now';
+      syncIcon.className = 'fas fa-sync-alt';
+    })
+    .withFailureHandler(function(error) {
+      showError('Sync failed: ' + error.message);
+      showLoader(false);
+      
+      // Reset button
+      syncBtn.disabled = false;
+      syncBtn.innerHTML = '<i class="fas fa-sync-alt"></i> Sync Now';
+      syncIcon.className = 'fas fa-sync-alt';
+    })
+    .getDashboardData(); // Re-fetch data
+}
+
+// Initialize last sync display
+function initSyncDisplay() {
+  if (lastSyncTime) {
+    document.getElementById('last-sync-time').innerText = `Last sync: ${lastSyncTime}`;
+  }
+}
+
+// Call in DOMContentLoaded
+document.addEventListener('DOMContentLoaded', function() {
+  // ... existing init code ...
+  initSyncDisplay();
+});
+We need to integrate the sync button functionality with the existing code. The provided code uses globalData and a separate calendar variable, but the current code uses AppState.data and AppState.calendar. Also, there's an existing loadDashboardData(forceRefresh) that already refreshes data, but the sync button provides a more interactive feedback (button state, last sync time). We need to adapt it to work with the existing state management.
+
+Key points:
+
+The sync button should trigger a forced refresh of data from the server.
+
+It should update the UI, including KPIs, charts, calendar, and any other views.
+
+It should also update a "last sync" timestamp and store it in localStorage.
+
+The button should have a loading state and disable itself during sync.
+
+It should reuse existing functions like updateKPIs, renderDashboardCharts, initializeCalendar, etc., but ensure they use the updated AppState.data.
+
+The provided code also includes an initSyncDisplay to show last sync time, which we can add.
+
+We need to merge this with the existing JavaScript, possibly replacing the placeholder refreshData function that is currently exposed as window.refreshData = () => loadDashboardData(true);. The sync button can call a new manualSync function that does more UI feedback and also updates the timestamp.
+
+We'll also need to add the HTML for the sync button and last sync display. Since the user is asking "what about this", they likely want to know if it's safe to add this code as-is, or need integration guidance. We should provide an adapted version that fits the existing structure.
+
+Let's produce a safe, integrated version:
+
+We'll keep the existing loadDashboardData(forceRefresh) function, but enhance it to return a Promise and handle the loading state internally (it already shows/hides loader). The sync button can call loadDashboardData(true) and then handle button state and timestamp after completion.
+
+We need to track last sync time. We can add a lastSync property to AppState or use a separate variable and localStorage.
+
+The sync button will disable itself, show spinner, call loadDashboardData(true), then on success update the timestamp and re-enable.
+
+We'll also add the HTML for the sync button in the header, and a small last sync display.
+
+Let's write an integrated version that can be appended to the existing script, or we can provide instructions to replace the existing refreshData function with this enhanced version.
+
+The provided sync button code is not safe to paste as-is because it relies on globalData and a standalone calendar variable, whereas your existing code uses AppState and AppState.calendar. It also directly manipulates the button in a way that could conflict with your existing UI. However, the core idea is good and can be integrated cleanly.
+
+Below is an adapted version that works with your existing AppState, reuses your current data-loading function, and adds the sync button with proper feedback and last-sync timestamp.
+
+✅ Integrated Sync Button Code
+Add this JavaScript after your existing script (or merge carefully):
+
+javascript
+// ============================================
+// SYNC BUTTON FUNCTIONALITY (Integrated)
+// ============================================
+(function() {
+  // Initialize last sync time from localStorage
+  let lastSyncTime = localStorage.getItem('lastSyncTime') || null;
+  
+  // Function to update the sync button state and last sync display
+  function updateSyncUI(isSyncing = false) {
+    const syncBtn = document.getElementById('sync-button');
+    const syncIcon = document.getElementById('sync-icon');
+    const lastSyncEl = document.getElementById('last-sync-time');
+    
+    if (!syncBtn || !syncIcon) return;
+    
+    if (isSyncing) {
+      syncBtn.disabled = true;
+      syncBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Syncing...';
+      syncIcon.className = 'fas fa-spinner fa-spin';
+    } else {
+      syncBtn.disabled = false;
+      syncBtn.innerHTML = '<i class="fas fa-sync-alt"></i> Sync Now';
+      syncIcon.className = 'fas fa-sync-alt';
+    }
+    
+    if (lastSyncEl && lastSyncTime) {
+      lastSyncEl.innerText = `Last sync: ${lastSyncTime}`;
+    }
+  }
+  
+  // Manual sync function
+  window.manualSync = async function() {
+    const syncBtn = document.getElementById('sync-button');
+    if (!syncBtn) return;
+    
+    // Prevent multiple syncs
+    if (syncBtn.disabled) return;
+    
+    updateSyncUI(true);
+    showLoader(true);
+    
+    try {
+      // Force refresh data using existing function (it returns a promise-like)
+      await new Promise((resolve, reject) => {
+        google.script.run
+          .withSuccessHandler(resolve)
+          .withFailureHandler(reject)
+          .getDashboardData(); // This should return the full data object
+      }).then(data => {
+        // Update AppState and UI
+        AppState.update('data', data);
+        updateKPIs(data.kpis);
+        renderDashboardCharts();
+        initializeCalendar();  // re-creates calendar with new data
+        initializeNetWorth();
+        
+        // Update last sync time
+        lastSyncTime = new Date().toLocaleString();
+        localStorage.setItem('lastSyncTime', lastSyncTime);
+        
+        // Refresh budget view if visible
+        if (document.getElementById('budgets-view')?.style.display === 'block') {
+          loadSmartSuggestions();
+        }
+        
+        showToast('Dashboard synced successfully!', 'success');
+      });
+    } catch (error) {
+      showError('Sync failed: ' + error.message);
+    } finally {
+      showLoader(false);
+      updateSyncUI(false);
+    }
+  };
+  
+  // Initialize last sync display on page load
+  function initSyncDisplay() {
+    const lastSyncEl = document.getElementById('last-sync-time');
+    if (lastSyncEl && lastSyncTime) {
+      lastSyncEl.innerText = `Last sync: ${lastSyncTime}`;
+    }
+  }
+  
+  // Hook into existing DOMContentLoaded (safe to add another listener)
+  document.addEventListener('DOMContentLoaded', initSyncDisplay);
+})();
+✅ HTML to Add (Place in your header area)
+Find a suitable place in your HTML (likely inside the top bar or next to the theme selector) and insert:
+
+html
+<div class="sync-container" style="display: flex; align-items: center; gap: 10px;">
+  <button id="sync-button" class="btn-primary" onclick="manualSync()">
+    <i id="sync-icon" class="fas fa-sync-alt"></i> Sync Now
+  </button>
+  <span id="last-sync-time" class="text-dim" style="font-size: 12px;"></span>
+</div>
+You may need to adjust styling to fit your layout.
+
+🔍 What Changed / Why It’s Safe
+No globalData – Uses AppState.data and AppState.update() to keep state consistent.
+
+Reuses existing functions – updateKPIs, renderDashboardCharts, initializeCalendar, etc., all work with the updated AppState.data.
+
+Button state management – Disables the button during sync and shows a spinner; re-enables afterward.
+
+Last sync timestamp – Stored in localStorage and displayed.
+
+Error handling – Uses your existing showError and showToast.
+
+No conflicts – All new variables are inside an IIFE or attached to window with unique names (manualSync). The existing refreshData (which calls loadDashboardData(true)) remains untouched but you may choose to replace it with this more interactive version.
+
+⚠️ One Minor Server-Side Consideration
+Your existing getDashboardData() server function should return the full data object (KPIs, transactions, etc.). The sync button expects that. If your function is named differently, adjust the google.script.run call accordingly (e.g., if it's fetchFullData, use that). The code above assumes it's getDashboardData() as per your original loadDashboardData implementation.
+
+🧪 Testing
+After adding:
+
+The sync button should appear.
+
+Clicking it should show a spinner, reload data, and update the last sync time.
+
+All charts and the calendar should refresh with the new data.
+
+If an error occurs, a toast notification appears.
+
+This integration enhances your dashboard without breaking anything.

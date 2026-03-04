@@ -96,13 +96,12 @@ function _getTransactions(useCache = true) {
     return _Config.cachedTransactions;
   }
 
-  const rawData = _getCoreTransactionData();
-  const parsedData = _parseTransactions(rawData);
-  
-  // Update cache
+  var rawData = _getCoreTransactionData() || [];
+  var parsedData = _parseTransactions(rawData) || [];
+
   _Config.cachedTransactions = parsedData;
   _Config.lastFetchTime = now;
-  
+
   return parsedData;
 }
 

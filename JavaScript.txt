@@ -55,7 +55,7 @@
       initializeTheme();
       await initializeApp();
       initializeEventListeners();
-      initializeServiceWorker();
+      // initializeServiceWorker();  // Disabled - no sw.js; causes 404
     } catch (error) {
       showError('Failed to initialize application: ' + error.message);
     }
@@ -216,7 +216,7 @@
           if (parsed && parsed.data && parsed.timestamp) {
             var txsCount = (parsed.data.transactions || []).length;
             var effectiveTtl = txsCount > largeDataThreshold ? 60000 : cacheTime;
-            if (Date.now() - parsed.timestamp < effectiveTtl) {
+            if (Date.now() - parsed.timestamp < effectiveTtl && parsed.data) {
               processDashboardData(parsed.data);
               return;
             }
@@ -236,6 +236,14 @@
             .withFailureHandler(reject)
             .getDashboardData();
         });
+
+        if (!data) {
+          console.error('Server returned null');
+          showError('Server returned no data');
+          showLoader(false);
+          return;
+        }
+        console.log('RAW DATA FROM SERVER: transactions=' + (data.transactions ? data.transactions.length : 0));
 
         try {
           var payload = JSON.stringify({ data: data, timestamp: Date.now() });
@@ -265,6 +273,10 @@
   }
 
   function processDashboardData(data) {
+    if (!data) {
+      console.error('processDashboardData: data is null/undefined');
+      return;
+    }
     AppState.update('data', data);
     updateKPIs(data.kpis);
     renderDashboardCharts();
@@ -2019,6 +2031,10 @@
           .withFailureHandler(reject)
           .getDashboardData();
       });
+      if (!data) {
+        showError('Sync returned no data');
+        return;
+      }
       invalidateDataSnapshot();
       AppState.update('data', data);
       updateKPIs(data.kpis);

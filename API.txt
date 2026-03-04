@@ -4,8 +4,18 @@
  */
 
 function getDashboardData() {
+  var emptyKpis = { balance: '0', income: '0', expense: '0', savingsRate: '0', avgIncome: '0', avgExpense: '0', daysToPayday: 0 };
+  var emptyPayload = {
+    transactions: [],
+    settings: {},
+    budgets: {},
+    nw: { assets: [], liabilities: [] },
+    goals: [],
+    kpis: emptyKpis
+  };
+
   try {
-    var parsed = _getTransactions();
+    var parsed = _getTransactions() || [];
     var settings = JSON.parse(_Config.getUserProp_(_Config.KEYS.SETTINGS_PROP_KEY) || '{"source":"active"}');
     var budgets = JSON.parse(_Config.getUserProp_(_Config.KEYS.BUDGETS_PROP_KEY) || '{}');
     var nw = JSON.parse(_Config.getUserProp_(_Config.KEYS.NET_WORTH_KEY) || '{"assets":[], "liabilities":[]}');
@@ -22,7 +32,7 @@ function getDashboardData() {
   } catch (e) {
     var msg = (e && e.message) ? e.message : String(e);
     console.error('getDashboardData error:', msg);
-    throw new Error(msg);
+    return emptyPayload;
   }
 }
 

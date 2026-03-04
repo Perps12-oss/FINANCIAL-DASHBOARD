@@ -206,48 +206,59 @@
     if (typeof forceRefresh === 'undefined') forceRefresh = false;
     var cacheKey = 'dashboardData';
     var cacheTime = 5 * 60 * 1000;
+    var largeDataThreshold = 5000;
 
     if (!forceRefresh) {
-      var cached = sessionStorage.getItem(cacheKey);
-      if (cached) {
-        try {
-          const { data, timestamp } = JSON.parse(cached);
-          if (Date.now() - timestamp < cacheTime) {
-            processDashboardData(data);
-            return;
+      try {
+        var cached = sessionStorage.getItem(cacheKey);
+        if (cached) {
+          var parsed = JSON.parse(cached);
+          if (parsed && parsed.data && parsed.timestamp) {
+            var txsCount = (parsed.data.transactions || []).length;
+            var effectiveTtl = txsCount > largeDataThreshold ? 60000 : cacheTime;
+            if (Date.now() - parsed.timestamp < effectiveTtl) {
+              processDashboardData(parsed.data);
+              return;
+            }
           }
-        } catch (e) {
-          // Invalid cache, ignore
         }
+      } catch (e) {
+        invalidateDataSnapshot();
       }
     }
 
-    // Load fresh data with retry
-    let retries = 3;
+    var retries = 3;
     while (retries > 0) {
       try {
-        const data = await new Promise((resolve, reject) => {
+        var data = await new Promise(function(resolve, reject) {
           google.script.run
             .withSuccessHandler(resolve)
             .withFailureHandler(reject)
             .getDashboardData();
         });
-        
-        // Cache the data
-        sessionStorage.setItem(cacheKey, JSON.stringify({
-          data,
-          timestamp: Date.now()
-        }));
-        
+
+        try {
+          var payload = JSON.stringify({ data: data, timestamp: Date.now() });
+          var txsCount = (data.transactions || []).length;
+          if (txsCount <= largeDataThreshold || payload.length < 4500000) {
+            sessionStorage.setItem(cacheKey, payload);
+          }
+        } catch (quotaErr) {
+          if (quotaErr.name === 'QuotaExceededError' || quotaErr.code === 22) {
+            invalidateDataSnapshot();
+          }
+        }
+
         processDashboardData(data);
         return;
       } catch (error) {
         retries--;
+        var msg = (error && error.message) ? error.message : 'Unknown error';
         if (retries === 0) {
-          showError('Failed to load data after multiple attempts');
+          showError('Failed to load data: ' + msg);
           showLoader(false);
         } else {
-          await new Promise(r => setTimeout(r, 1000)); // Wait 1s before retry
+          await new Promise(function(r) { setTimeout(r, 1000); });
         }
       }
     }
@@ -1846,7 +1857,7 @@
     // Re-render relevant charts using the filtered data
     renderFilteredCharts();
     
-    document.getElementById('filtered-summary').style.display = 'block';
+    document.getElementById('filtered-summary').style.display = 'grid';
     showToast(`Showing ${filteredData.length} transactions`, 'success');
   };
 
@@ -1972,25 +1983,21 @@
   let lastSyncTime = localStorage.getItem('lastSyncTime') || null;
   
   // Function to update the sync button state and last sync display
-  function updateSyncUI(isSyncing = false) {
-    const syncBtn = document.getElementById('sync-button');
-    const syncIcon = document.getElementById('sync-icon');
-    const lastSyncEl = document.getElementById('last-sync-time');
-    
-    if (!syncBtn || !syncIcon) return;
-    
+  function updateSyncUI(isSyncing) {
+    if (typeof isSyncing === 'undefined') isSyncing = false;
+    var syncBtn = document.getElementById('sync-button');
+    var lastSyncEl = document.getElementById('last-sync-time');
+    if (!syncBtn) return;
+
     if (isSyncing) {
       syncBtn.disabled = true;
       syncBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Syncing...';
-      syncIcon.className = 'fas fa-spinner fa-spin';
     } else {
       syncBtn.disabled = false;
       syncBtn.innerHTML = '<i class="fas fa-sync-alt"></i> Sync Now';
-      syncIcon.className = 'fas fa-sync-alt';
     }
-    
     if (lastSyncEl && lastSyncTime) {
-      lastSyncEl.innerText = `Last sync: ${lastSyncTime}`;
+      lastSyncEl.innerText = 'Last sync: ' + lastSyncTime;
     }
   }
   

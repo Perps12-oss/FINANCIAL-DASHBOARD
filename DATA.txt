@@ -1,6 +1,13 @@
 /**
  * CORE DATA ENGINE v2.0
  * Enhanced with caching, robust parsing, and smarter analytics.
+ *
+ * SHEET REQUIREMENTS (case-sensitive tab name: "Personal Account Transactions"):
+ * - Row 1: Headers (fixed)
+ * - Required: Date, (Description OR Name), (Amount OR Local amount)
+ * - Optional: Category, Category split, Type (income/expense for sign)
+ * - Date: ISO, Excel serial, DD/MM/YYYY, MM/DD/YYYY
+ * - Amount: Strips £$€, commas, spaces. Type column can flip sign.
  */
 
 const _Config = (function() {
@@ -100,11 +107,19 @@ function _getTransactions(useCache = true) {
 }
 
 /**
- * Gets raw data from the sheet (Active or External)
+ * Gets raw data from the sheet (Active or External).
+ * Sheet name is case-sensitive: 'Personal Account Transactions'.
  */
 function _getCoreTransactionData() {
-  const settings = JSON.parse(_Config.getUserProp_(_Config.KEYS.SETTINGS_PROP_KEY) || '{"source":"active"}');
-  let ss;
+  var settings = {};
+  try {
+    settings = JSON.parse(_Config.getUserProp_(_Config.KEYS.SETTINGS_PROP_KEY) || '{"source":"active"}');
+  } catch (e) {
+    console.warn('Invalid settings, using active spreadsheet');
+  }
+
+  var ss;
+  var sheetName = _Config.RUNTIME.TRANSACTION_SHEET_NAME;
 
   try {
     if (settings.source === 'external' && settings.externalId) {
@@ -113,48 +128,74 @@ function _getCoreTransactionData() {
       ss = SpreadsheetApp.getActiveSpreadsheet();
     }
 
-    const sheet = ss.getSheetByName(_Config.RUNTIME.TRANSACTION_SHEET_NAME);
-    
+    var sheet = ss.getSheetByName(sheetName);
     if (!sheet) {
-      console.error(`Sheet not found: ${_Config.RUNTIME.TRANSACTION_SHEET_NAME}`);
+      var tabNames = ss.getSheets().map(function(s) { return s.getName(); });
+      console.error('Sheet "' + sheetName + '" not found. Tabs: ' + tabNames.join(', '));
       return [];
     }
-    
-    // Optimization: Only fetch necessary columns if possible, but getDataRange is safer for dynamic structures
-    return sheet.getDataRange().getValues();
+
+    var range = sheet.getDataRange();
+    if (!range || range.getNumRows() < 2) {
+      console.warn('Sheet has no data rows (only header or empty)');
+      return range && range.getNumRows() === 1 ? range.getValues() : [[]];
+    }
+
+    return range.getValues();
   } catch (e) {
-    console.error(`Connection Error: ${e.message}`);
-    // Fallback
-    const fallback = SpreadsheetApp.getActiveSpreadsheet()
-      .getSheetByName(_Config.RUNTIME.TRANSACTION_SHEET_NAME);
-    return fallback ? fallback.getDataRange().getValues() : [];
+    console.error('Connection error: ' + e.message + ' | Stack: ' + (e.stack || ''));
+    try {
+      var fallback = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(sheetName);
+      return fallback ? fallback.getDataRange().getValues() : [];
+    } catch (e2) {
+      console.error('Fallback failed: ' + e2.message);
+      return [];
+    }
   }
 }
 
 /**
- * Robust date parser handling ISO strings and Excel Serials
+ * Robust date parser: ISO, Excel serials, DD/MM/YYYY, MM/DD/YYYY, locale formats.
  */
 function _parseDate_(dateInput) {
-  if (!dateInput) return null;
+  if (dateInput === null || dateInput === undefined || dateInput === '') return null;
 
-  // Case 1: Already a Date object
   if (Object.prototype.toString.call(dateInput) === '[object Date]') {
     if (!isNaN(dateInput.getTime())) return dateInput;
+    return null;
   }
 
-  // Case 2: Excel Serial Number (common in imports)
   if (typeof dateInput === 'number') {
-    // Excel serial date logic (approximation)
     return new Date((dateInput - 25569) * 86400 * 1000);
   }
 
-  // Case 3: String parsing
-  const parsed = new Date(dateInput);
-  if (parsed instanceof Date && !isNaN(parsed)) {
-    return parsed;
-  }
+  var str = String(dateInput).trim();
+  if (!str) return null;
 
+  var parsed = new Date(str);
+  if (!isNaN(parsed.getTime())) return parsed;
+
+  var tz = _Config.RUNTIME.DEFAULT_TIMEZONE || 'GMT';
+  var formats = ['yyyy-MM-dd', 'dd/MM/yyyy', 'MM/dd/yyyy', 'd/M/yyyy', 'dd-MM-yyyy', 'yyyy/MM/dd'];
+  for (var i = 0; i < formats.length; i++) {
+    try {
+      var d = Utilities.parseDate(str, tz, formats[i]);
+      if (d && !isNaN(d.getTime())) return d;
+    } catch (e) {}
+  }
   return null;
+}
+
+/**
+ * Parses amount: strips currency symbols, commas, spaces; handles negatives.
+ */
+function _parseAmount_(val) {
+  if (val === null || val === undefined) return 0;
+  if (typeof val === 'number') return isNaN(val) ? 0 : val;
+  var s = String(val).replace(/[\s£$€,]/g, '').trim();
+  if (!s) return 0;
+  var n = parseFloat(s);
+  return isNaN(n) ? 0 : n;
 }
 
 /**
@@ -171,50 +212,90 @@ function _toHex_(bytes) {
 }
 
 /**
- * Parses raw sheet data into structured objects with hashed IDs
+ * Resolves column index from header, with fallback aliases (case-insensitive).
+ * Aliases: description/name, amount/local amount, category/category split
+ */
+function _resolveColumn_(headers, primary, aliases) {
+  var i = headers.indexOf(primary);
+  if (i >= 0) return i;
+  for (var a = 0; a < (aliases || []).length; a++) {
+    i = headers.indexOf(aliases[a]);
+    if (i >= 0) return i;
+  }
+  return -1;
+}
+
+/**
+ * Parses raw sheet data into structured objects with hashed IDs.
+ * Supports flexible headers: Date, Description/Name, Amount/Local amount, Category/Category split.
  */
 function _parseTransactions(rows) {
-  if (!rows || rows.length < 2) return [];
-
-  var headers = rows[0].map(function(h) { return h.toString().toLowerCase().trim(); });
-  var indices = {
-    date: headers.indexOf('date'),
-    description: headers.indexOf('description'),
-    amount: headers.indexOf('amount'),
-    category: headers.indexOf('category')
-  };
-
-  if (indices.date === -1 || indices.description === -1 || indices.amount === -1) {
-    console.error('Missing critical headers (Date, Description, or Amount)');
+  if (!rows || !rows.length) return [];
+  if (rows.length === 1) {
+    console.warn('Sheet has only header row, no data');
     return [];
   }
 
-  return rows.slice(1)
-    .map(function(row, rowIndex) {
-      var dateVal = _parseDate_(row[indices.date]);
-      var desc = row[indices.description];
-      var amt = parseFloat(row[indices.amount]) || 0;
+  var headers = rows[0].map(function(h) { return String(h || '').toLowerCase().trim(); });
+  var dateIdx = _resolveColumn_(headers, 'date', []);
+  var descIdx = _resolveColumn_(headers, 'description', ['name']);
+  var amtIdx = _resolveColumn_(headers, 'amount', ['local amount']);
+  var catIdx = _resolveColumn_(headers, 'category', ['category split']);
+  var typeIdx = _resolveColumn_(headers, 'type', []);
 
-      if (!dateVal || !desc) return null;
+  if (dateIdx === -1 || descIdx === -1 || amtIdx === -1) {
+    console.error('Missing required headers. Found: ' + headers.join(', ') + '. Need: date, description or name, amount or local amount');
+    return [];
+  }
 
-      var dateISO = dateVal.toISOString().split('T')[0];
-      var hashBytes = Utilities.computeDigest(Utilities.DigestAlgorithm.MD5,
-        dateISO + '-' + desc + '-' + amt,
-        Utilities.Charset.UTF_8
-      );
-      var hash = _toHex_(hashBytes);
+  var parsed = [];
+  var skipped = 0;
+  for (var rowIndex = 0; rowIndex < rows.length - 1; rowIndex++) {
+    var row = rows[rowIndex + 1];
+    var dateVal = _parseDate_(row[dateIdx]);
+    var descRaw = row[descIdx];
+    var desc = descRaw !== null && descRaw !== undefined ? String(descRaw).trim().replace(/\r?\n/g, ' ') : '';
+    if (!desc) {
+      var nameIdx = headers.indexOf('name');
+      if (nameIdx >= 0 && row[nameIdx] !== undefined) desc = String(row[nameIdx] || '').trim().replace(/\r?\n/g, ' ');
+    }
+    if (!desc) desc = 'Unspecified';
+    var amt = _parseAmount_(row[amtIdx]);
 
-      return {
-        id: hash,
-        date: dateISO,
-        dateObj: dateVal,
-        description: desc.toString().trim(),
-        amount: amt,
-        category: indices.category !== -1 ? (row[indices.category] || 'Uncategorized') : 'Uncategorized',
-        arrayIndex: rowIndex
-      };
-    })
-    .filter(function(t) { return t !== null; });
+    if (!dateVal) {
+      skipped++;
+      continue;
+    }
+
+    if (typeIdx >= 0 && row[typeIdx] !== undefined) {
+      var typeStr = String(row[typeIdx]).toLowerCase();
+      if ((typeStr.indexOf('expense') >= 0 || typeStr.indexOf('debit') >= 0) && amt > 0) amt = -amt;
+      if ((typeStr.indexOf('income') >= 0 || typeStr.indexOf('credit') >= 0) && amt < 0) amt = -amt;
+    }
+
+    var dateISO = dateVal.toISOString().split('T')[0];
+    var hashBytes = Utilities.computeDigest(Utilities.DigestAlgorithm.MD5,
+      dateISO + '-' + desc + '-' + amt,
+      Utilities.Charset.UTF_8
+    );
+    var hash = _toHex_(hashBytes);
+    var catVal = catIdx >= 0 && row[catIdx] !== undefined && row[catIdx] !== ''
+      ? String(row[catIdx]).trim() : 'Uncategorized';
+
+    parsed.push({
+      id: hash,
+      date: dateISO,
+      dateObj: dateVal,
+      description: desc,
+      amount: amt,
+      category: catVal || 'Uncategorized',
+      arrayIndex: rowIndex
+    });
+  }
+
+  if (skipped > 0) Logger.log('[DATA] Skipped ' + skipped + ' rows with invalid dates');
+  Logger.log('[DATA] Parsed ' + parsed.length + ' transactions (sheet: ' + (rows.length - 1) + ' rows)');
+  return parsed;
 }
 
 /**

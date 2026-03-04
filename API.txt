@@ -5,11 +5,11 @@
 
 function getDashboardData() {
   try {
-    const parsed = _getTransactions();
-    const settings = JSON.parse(_Config.getUserProp_(_Config.KEYS.SETTINGS_PROP_KEY) || '{"source":"active"}');
-    const budgets = JSON.parse(_Config.getUserProp_(_Config.KEYS.BUDGETS_PROP_KEY) || '{}');
-    const nw = JSON.parse(_Config.getUserProp_(_Config.KEYS.NET_WORTH_KEY) || '{"assets":[], "liabilities":[]}');
-    const goals = JSON.parse(_Config.getUserProp_(_Config.KEYS.GOALS_PROP_KEY) || '[]');
+    var parsed = _getTransactions();
+    var settings = JSON.parse(_Config.getUserProp_(_Config.KEYS.SETTINGS_PROP_KEY) || '{"source":"active"}');
+    var budgets = JSON.parse(_Config.getUserProp_(_Config.KEYS.BUDGETS_PROP_KEY) || '{}');
+    var nw = JSON.parse(_Config.getUserProp_(_Config.KEYS.NET_WORTH_KEY) || '{"assets":[], "liabilities":[]}');
+    var goals = JSON.parse(_Config.getUserProp_(_Config.KEYS.GOALS_PROP_KEY) || '[]');
 
     return {
       transactions: parsed,
@@ -20,8 +20,9 @@ function getDashboardData() {
       kpis: _calculateKPIs(parsed)
     };
   } catch (e) {
-    console.error('getDashboardData error:', e);
-    throw new Error('Failed to load dashboard data: ' + e.message);
+    var msg = (e && e.message) ? e.message : String(e);
+    console.error('getDashboardData error:', msg);
+    throw new Error(msg);
   }
 }
 

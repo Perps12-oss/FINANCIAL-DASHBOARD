@@ -25,13 +25,39 @@
 
     <!-- Main Content -->
     <main class="content">
-      <!-- KPI Header -->
+      <!-- KPI Header + Sync -->
       <header class="kpi-header">
         <div class="kpi-card glass" onclick="openKpiDetail('balance')"><h3>Balance</h3><div class="kpi-val" id="kpi-balance">£0</div></div>
         <div class="kpi-card glass" onclick="openKpiDetail('income')"><h3>Income</h3><div class="kpi-val" id="kpi-income">£0</div></div>
         <div class="kpi-card glass" onclick="openKpiDetail('expenses')"><h3>Expense</h3><div class="kpi-val" id="kpi-expense">£0</div></div>
         <div class="kpi-card glass" onclick="openKpiDetail('savings')"><h3>Savings</h3><div class="kpi-val" id="kpi-savings">0%</div></div>
+        <div class="kpi-sync-wrap glass" style="display: flex; align-items: center; gap: 12px; padding: 12px 20px;">
+          <button id="sync-button" class="btn-primary" onclick="manualSync()"><i class="fas fa-sync-alt"></i> Sync Now</button>
+          <span id="last-sync-time" style="font-size: 12px; color: var(--text-dim);">Last sync: Never</span>
+        </div>
       </header>
+
+      <!-- Date Range Filter Bar -->
+      <div class="filter-bar glass" style="margin-bottom: 20px; padding: 12px 20px; display: flex; flex-wrap: wrap; align-items: center; gap: 12px;">
+        <span style="color: var(--text-dim); font-size: 13px;">Date range:</span>
+        <input type="date" id="start-date" style="background: rgba(0,0,0,0.3); border: 1px solid var(--glass-border); color: var(--text); padding: 8px 12px; border-radius: 6px;">
+        <span style="color: var(--text-dim);">to</span>
+        <input type="date" id="end-date" style="background: rgba(0,0,0,0.3); border: 1px solid var(--glass-border); color: var(--text); padding: 8px 12px; border-radius: 6px;">
+        <button class="btn-outline btn-small" onclick="setQuickRange('month')">Month</button>
+        <button class="btn-outline btn-small" onclick="setQuickRange('quarter')">Quarter</button>
+        <button class="btn-outline btn-small" onclick="setQuickRange('year')">Year</button>
+        <button class="btn-outline btn-small" onclick="setQuickRange('all')">All</button>
+        <button class="btn-primary btn-small" onclick="applyDateFilter()">Apply</button>
+        <button class="btn-outline btn-small" onclick="clearFilter()">Clear</button>
+      </div>
+
+      <!-- Filtered Summary (hidden until filter applied) -->
+      <div id="filtered-summary" class="glass" style="display: none; margin-bottom: 20px; padding: 15px; grid-template-columns: repeat(4, 1fr); gap: 16px;">
+        <div><span style="font-size: 12px; color: var(--text-dim);">Filtered Balance</span><div id="filtered-balance" style="font-size: 20px; font-weight: 700;">£0</div></div>
+        <div><span style="font-size: 12px; color: var(--text-dim);">Income</span><div id="filtered-income" style="font-size: 20px; color: var(--success);">£0</div></div>
+        <div><span style="font-size: 12px; color: var(--text-dim);">Expense</span><div id="filtered-expense" style="font-size: 20px; color: var(--danger);">£0</div></div>
+        <div><span style="font-size: 12px; color: var(--text-dim);">Transactions</span><div id="filtered-count" style="font-size: 20px; font-weight: 600;">0</div></div>
+      </div>
 
       <section id="page-content">
         <div id="loader" class="loader-container" style="display: none;"><div class="spinner"></div><p>Loading data...</p></div>

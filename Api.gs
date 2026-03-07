@@ -1,0 +1,166 @@
+/**
+ * PUBLIC API ENDPOINTS
+ * All google.script.run calls go here
+ */
+
+function getDashboardData() {
+  try {
+    const parsed = _getTransactions();
+    const settings = JSON.parse(_Config.getUserProp_(_Config.KEYS.SETTINGS_PROP_KEY) || '{"source":"active"}');
+    const budgets = JSON.parse(_Config.getUserProp_(_Config.KEYS.BUDGETS_PROP_KEY) || '{}');
+    const nw = JSON.parse(_Config.getUserProp_(_Config.KEYS.NET_WORTH_KEY) || '{"assets":[], "liabilities":[]}');
+    const goals = JSON.parse(_Config.getUserProp_(_Config.KEYS.GOALS_PROP_KEY) || '[]');
+
+    return {
+      transactions: parsed,
+      settings: settings,
+      budgets: budgets,
+      nw: nw,
+      goals: goals,
+      kpis: _calculateKPIs(parsed)
+    };
+  } catch (e) {
+    console.error('getDashboardData error:', e);
+    throw new Error('Failed to load dashboard data: ' + e.message);
+  }
+}
+
+function getMatrixData(startDate, endDate) {
+  try {
+    return _get3DMatrixData(startDate || null, endDate || null);
+  } catch (e) {
+    console.error('getMatrixData error:', e);
+    return { x: [], y: [], z: [] };
+  }
+}
+
+function fetchSankeyData(startDate, endDate) {
+  try {
+    return _getSankeyData(startDate || null, endDate || null);
+  } catch (e) {
+    console.error('fetchSankeyData error:', e);
+    return { labels: [], sources: [], targets: [], values: [], colors: [] };
+  }
+}
+
+function getSmartBudgets() {
+  try {
+    return _getSmartBudgetSuggestions();
+  } catch (e) {
+    console.error('getSmartBudgets error:', e);
+    return [];
+  }
+}
+
+function getForecastData(adjustments) {
+  try {
+    return _calculateForecast(adjustments || { incomeMod: 0, expenseMod: 0 });
+  } catch (e) {
+    console.error('getForecastData error:', e);
+    return [];
+  }
+}
+
+function testExternalConnection(sheetId) {
+  try {
+    const ss = SpreadsheetApp.openById(sheetId);
+    const sheet = ss.getSheetByName(_Config.RUNTIME.TRANSACTION_SHEET_NAME);
+    
+    if (sheet) {
+      return { success: true, name: ss.getName() };
+    } else {
+      return { 
+        success: false, 
+        message: `Tab '${_Config.RUNTIME.TRANSACTION_SHEET_NAME}' not found in that sheet.` 
+      };
+    }
+  } catch (e) {
+    return { 
+      success: false, 
+      message: 'Invalid ID or No Permission. Ensure the sheet is shared with you.' 
+    };
+  }
+}
+
+function updateDataSource(sourceType, externalId) {
+  try {
+    const currentSettings = JSON.parse(_Config.getUserProp_(_Config.KEYS.SETTINGS_PROP_KEY) || '{}');
+    currentSettings.source = sourceType;
+    currentSettings.externalId = externalId;
+    
+    _Config.setUserProp_(_Config.KEYS.SETTINGS_PROP_KEY, JSON.stringify(currentSettings));
+    _logSystem('INFO', 'Data source updated', `Source: ${sourceType}, ID: ${externalId || 'none'}`);
+    return { status: 'success' };
+  } catch (e) {
+    return { status: 'error', message: e.message };
+  }
+}
+
+function saveUserSettings(settings) {
+  try {
+    _Config.setUserProp_(_Config.KEYS.SETTINGS_PROP_KEY, JSON.stringify(settings));
+    return { status: 'success' };
+  } catch (e) {
+    return { status: 'error', message: e.message };
+  }
+}
+
+function saveFinalBudgets(budgetMap) {
+  try {
+    _Config.setUserProp_(_Config.KEYS.BUDGETS_PROP_KEY, JSON.stringify(budgetMap));
+    return { status: 'success' };
+  } catch (e) {
+    return { status: 'error', message: e.message };
+  }
+}
+
+function saveNetWorth(data) {
+  try {
+    _Config.setUserProp_(_Config.KEYS.NET_WORTH_KEY, JSON.stringify(data));
+    return { status: 'success' };
+  } catch (e) {
+    return { status: 'error', message: e.message };
+  }
+}
+
+function processImportData(dataArray) {
+  try {
+    return _saveImportedTransactions(dataArray);
+  } catch (e) {
+    console.error('processImportData error:', e);
+    return false;
+  }
+}
+
+function getAISuggestion(description) {
+  try {
+    return suggestCategory(description);
+  } catch (e) {
+    return 'Uncategorized';
+  }
+}
+
+function setUserProp(key, value) {
+  try {
+    if (!key || typeof key !== 'string') {
+      return { status: 'error', message: 'Invalid key' };
+    }
+    _Config.setUserProp_(key, value);
+    return { status: 'success' };
+  } catch (e) {
+    return { status: 'error', message: e.message };
+  }
+}
+
+function _logSystem(level, message, source) {
+  try {
+    Logger.log(level + ': ' + message + ' (' + (source || 'API') + ')');
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var logSheet = ss.getSheetByName('_SystemLog');
+    if (logSheet) {
+      logSheet.appendRow([new Date(), level, message, source || 'API']);
+    }
+  } catch (e) {
+    Logger.log('Log failed: ' + e.message);
+  }
+}

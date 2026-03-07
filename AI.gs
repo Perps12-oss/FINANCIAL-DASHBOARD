@@ -86,8 +86,9 @@ function batchCategorizeTransactions() {
     return 0;
   }
 
-  const rawData = _getCoreTransactionData();
-  const txs = _parseTransactions(rawData);
+  var rawData = _getCoreTransactionData();
+  var parseResult = _parseTransactions(rawData);
+  var txs = parseResult.transactions || [];
   const uncategorized = txs.filter(function(t) {
     return !t.category || t.category === "" || t.category === "Uncategorized" || t.category.indexOf("Error") >= 0;
   });
@@ -138,9 +139,11 @@ function batchCategorizeTransactions() {
 }
 
 function generateInsights() {
-  const txs = _parseTransactions(_getCoreTransactionData());
+  var raw = _getCoreTransactionData();
+  var parsed = _parseTransactions(raw);
+  var txs = parsed.transactions || [];
   const currency = _Config.RUNTIME.CURRENCY_SYMBOL || '£';
-  if (!txs || txs.length === 0) return [];
+  if (!txs.length) return [];
 
   const now = new Date();
   const currentMonth = now.getMonth();

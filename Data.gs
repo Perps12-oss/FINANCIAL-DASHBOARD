@@ -62,11 +62,25 @@ const _Config = (function() {
   function formatCurrency_(amount) {
     return `${RUNTIME.CURRENCY_SYMBOL}${parseFloat(amount).toFixed(2)}`;
   }
-  
+  var SCRIPT_KEY_DATA_SHEET_ID = 'DATA_SHEET_ID';
+  function getEffectiveDataSettings_() {
+    var userJson = getUserProp_(KEYS.SETTINGS_PROP_KEY);
+    if (userJson && userJson.trim() !== '') {
+      try {
+        var parsed = JSON.parse(userJson);
+        if (parsed && ((parsed.source === 'external' && parsed.externalId) || parsed.source === 'active')) return parsed;
+      } catch (e) {}
+    }
+    var scriptId = PropertiesService.getScriptProperties().getProperty(SCRIPT_KEY_DATA_SHEET_ID);
+    if (scriptId && scriptId.trim() !== '') return { source: 'external', externalId: scriptId.trim() };
+    return { source: 'active' };
+  }
   return {
     RUNTIME,
     KEYS,
     AI,
+    SCRIPT_KEY_DATA_SHEET_ID: SCRIPT_KEY_DATA_SHEET_ID,
+    getEffectiveDataSettings_,
     getUserProp_,
     setUserProp_,
     clearCache_,
@@ -80,54 +94,75 @@ const _Config = (function() {
 
 /**
  * Fetches and parses transaction data with in-memory caching.
+ * @param {boolean} [useCache=true]
+ * @returns {{ transactions: Array, totalRows: number, validation: { valid: boolean, errors: string[], warnings: string[] } }}
  */
-function _getTransactions(useCache = true) {
-  const now = Date.now();
-  
-  // Return cached data if valid and requested
+function _getTransactions(useCache) {
+  if (useCache === undefined) useCache = true;
+  var now = Date.now();
   if (useCache && _Config.cachedTransactions && (now - _Config.lastFetchTime < _Config.RUNTIME.CACHE_DURATION_MS)) {
-    return _Config.cachedTransactions;
+    return { transactions: _Config.cachedTransactions, totalRows: _Config.cachedTransactions.length, validation: { valid: true, errors: [], warnings: [] } };
   }
-
-  const rawData = _getCoreTransactionData();
-  const parsedData = _parseTransactions(rawData);
-  
-  // Update cache
-  _Config.cachedTransactions = parsedData;
-  _Config.lastFetchTime = now;
-  
-  return parsedData;
+  try {
+    var rawResult = _getCoreTransactionData();
+    if (rawResult.error) {
+      return { transactions: [], totalRows: 0, validation: { valid: false, errors: [rawResult.error], warnings: [] } };
+    }
+    var parseResult = _parseTransactions(rawResult.rows || []);
+    var parsed = parseResult.transactions || [];
+    _Config.cachedTransactions = parsed;
+    _Config.lastFetchTime = now;
+    return { transactions: parsed, totalRows: parsed.length, validation: parseResult.validation || { valid: true, errors: [], warnings: [] } };
+  } catch (e) {
+    if (typeof _logSystem === 'function') _logSystem('ERROR', '_getTransactions failed: ' + e.message, '_getTransactions', e.stack);
+    return { transactions: [], totalRows: 0, validation: { valid: false, errors: [e.message], warnings: [] } };
+  }
 }
 
 /**
- * Gets raw data from the sheet (Active or External)
+ * Gets raw data from the sheet (Active or External).
+ * @returns {{ rows: Array, error: string|undefined }}
  */
 function _getCoreTransactionData() {
-  const settings = JSON.parse(_Config.getUserProp_(_Config.KEYS.SETTINGS_PROP_KEY) || '{"source":"active"}');
-  let ss;
-
+  var settings, ss, sheet;
+  try {
+    settings = _Config.getEffectiveDataSettings_();
+  } catch (e) {
+    if (typeof _logSystem === 'function') _logSystem('ERROR', 'getEffectiveDataSettings failed', '_getCoreTransactionData', e.message);
+    return { rows: [], error: 'Configuration error: ' + (e.message || 'unknown') };
+  }
   try {
     if (settings.source === 'external' && settings.externalId) {
       ss = SpreadsheetApp.openById(settings.externalId);
     } else {
-      ss = SpreadsheetApp.getActiveSpreadsheet();
+      try {
+        ss = SpreadsheetApp.getActiveSpreadsheet();
+      } catch (activeErr) {
+        var scriptId = PropertiesService.getScriptProperties().getProperty('SPREADSHEET_ID') || PropertiesService.getScriptProperties().getProperty(_Config.SCRIPT_KEY_DATA_SHEET_ID);
+        if (scriptId) ss = SpreadsheetApp.openById(scriptId);
+        else return { rows: [], error: 'Set Script Property DATA_SHEET_ID, or open the bound spreadsheet and run Initialize System.' };
+      }
     }
-
-    const sheet = ss.getSheetByName(_Config.RUNTIME.TRANSACTION_SHEET_NAME);
-    
+    if (!ss) return { rows: [], error: 'Spreadsheet not found.' };
+    sheet = ss.getSheetByName(_Config.RUNTIME.TRANSACTION_SHEET_NAME);
     if (!sheet) {
-      console.error(`Sheet not found: ${_Config.RUNTIME.TRANSACTION_SHEET_NAME}`);
-      return [];
+      if (typeof _logSystem === 'function') _logSystem('WARN', 'Sheet not found: ' + _Config.RUNTIME.TRANSACTION_SHEET_NAME, '_getCoreTransactionData');
+      return { rows: [], error: "Sheet '" + _Config.RUNTIME.TRANSACTION_SHEET_NAME + "' not found in the spreadsheet." };
     }
-    
-    // Optimization: Only fetch necessary columns if possible, but getDataRange is safer for dynamic structures
-    return sheet.getDataRange().getValues();
+    return { rows: sheet.getDataRange().getValues() };
   } catch (e) {
-    console.error(`Connection Error: ${e.message}`);
-    // Fallback
-    const fallback = SpreadsheetApp.getActiveSpreadsheet()
-      .getSheetByName(_Config.RUNTIME.TRANSACTION_SHEET_NAME);
-    return fallback ? fallback.getDataRange().getValues() : [];
+    if (typeof _logSystem === 'function') _logSystem('ERROR', 'Connection error: ' + e.message, '_getCoreTransactionData', e.stack);
+    try {
+      var scriptId = PropertiesService.getScriptProperties().getProperty('SPREADSHEET_ID') || PropertiesService.getScriptProperties().getProperty(_Config.SCRIPT_KEY_DATA_SHEET_ID);
+      if (scriptId) {
+        ss = SpreadsheetApp.openById(scriptId);
+        sheet = ss.getSheetByName(_Config.RUNTIME.TRANSACTION_SHEET_NAME);
+        return { rows: sheet ? sheet.getDataRange().getValues() : [] };
+      }
+    } catch (e2) {
+      if (typeof _logSystem === 'function') _logSystem('ERROR', 'Fallback read failed: ' + e2.message, '_getCoreTransactionData');
+    }
+    return { rows: [], error: e.message || 'Connection failed.' };
   }
 }
 
@@ -158,42 +193,36 @@ function _parseDate_(dateInput) {
 }
 
 /**
- * Parses raw sheet data into structured objects with hashed IDs
+ * Parses raw sheet data into structured objects. Validates structure.
+ * @param {Array|{rows:Array}} rowsOrObj - Raw rows or result from _getCoreTransactionData
+ * @returns {{ transactions: Array, validation: { valid: boolean, errors: string[], warnings: string[] } }}
  */
-function _parseTransactions(rows) {
-  if (!rows || rows.length < 2) return [];
-  
-  const headers = rows[0].map(h => h.toString().toLowerCase().trim());
-  const requiredHeaders = ['date', 'description', 'amount'];
-  
-  const indices = {
-    date: headers.indexOf('date'),
-    description: headers.indexOf('description'),
-    amount: headers.indexOf('amount'),
-    category: headers.indexOf('category')
-  };
-
-  if (indices.date === -1 || indices.description === -1 || indices.amount === -1) {
-    console.error('Missing critical headers (Date, Description, or Amount)');
-    return [];
+function _parseTransactions(rowsOrObj) {
+  var rows = Array.isArray(rowsOrObj) ? rowsOrObj : (rowsOrObj && rowsOrObj.rows) ? rowsOrObj.rows : [];
+  var validation = { valid: true, errors: [], warnings: [] };
+  if (!rows || rows.length < 2) {
+    if (rows && rows.length === 1) validation.warnings.push('Only header row present; no transaction rows.');
+    return { transactions: [], validation: validation };
   }
-  
-  return rows.slice(1)
-    .map((row, rowIndex) => {
-      const dateVal = _parseDate_(row[indices.date]);
-      const desc = row[indices.description];
-      const amt = parseFloat(row[indices.amount]) || 0;
-
-      if (!dateVal || !desc) return null; // Skip invalid rows silently
-
-      const dateISO = dateVal.toISOString().split('T')[0];
-      
-      // Create a unique hash for duplicate detection
-      const hash = Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, 
-        `${dateISO}-${desc}-${amt}`, 
-        Utilities.Charset.UTF_8
-      ).map(b => ('0' + (b & 0xFF).toString(16)).slice(-2)).join('');
-
+  var headers = rows[0].map(function(h) { return h.toString().toLowerCase().trim(); });
+  var required = ['date', 'description', 'amount'];
+  var indices = { date: headers.indexOf('date'), description: headers.indexOf('description'), amount: headers.indexOf('amount'), category: headers.indexOf('category') };
+  if (indices.date === -1 || indices.description === -1 || indices.amount === -1) {
+    validation.valid = false;
+    validation.errors.push('Missing required columns: need Date, Description, Amount. Found: ' + headers.join(', '));
+    return { transactions: [], validation: validation };
+  }
+  if (indices.category === -1) validation.warnings.push('No Category column; all transactions will be Uncategorized.');
+  var skipped = 0;
+  var transactions = rows.slice(1)
+    .map(function(row, rowIndex) {
+      var dateVal = _parseDate_(row[indices.date]);
+      var desc = row[indices.description];
+      var amt = parseFloat(row[indices.amount]) || 0;
+      if (!dateVal || !desc) { skipped++; return null; }
+      var dateISO = dateVal.toISOString().split('T')[0];
+      var hash = Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, dateISO + '-' + desc + '-' + amt, Utilities.Charset.UTF_8)
+        .map(function(b) { return ('0' + (b & 0xFF).toString(16)).slice(-2); }).join('');
       return {
         id: hash,
         date: dateISO,
@@ -201,54 +230,54 @@ function _parseTransactions(rows) {
         description: desc.toString().trim(),
         amount: amt,
         category: indices.category !== -1 ? (row[indices.category] || 'Uncategorized') : 'Uncategorized',
-        arrayIndex: rowIndex // 0-based; sheet row = rowIndex + 2
+        arrayIndex: rowIndex
       };
     })
-    .filter(t => t !== null);
+    .filter(function(t) { return t !== null; });
+  if (skipped > 0) validation.warnings.push('Skipped ' + skipped + ' rows with missing date or description.');
+  return { transactions: transactions, validation: validation };
 }
 
 /**
- * Calculate KPIs with 3-month rolling averages
+ * Calculate KPIs with 3-month rolling averages. Does not mutate input.
+ * @param {Array} txs - Transaction objects (date, amount, etc.)
+ * @returns {{ balance: string, income: string, expense: string, savingsRate: string, daysToPayday: number, avgIncome: string, avgExpense: string }}
  */
 function _calculateKPIs(txs) {
-  if (!txs.length) {
-    return { balance: '0.00', income: '0.00', expense: '0.00', savingsRate: '0', avgIncome: '0.00', avgExpense: '0.00' };
+  var def = { balance: '0.00', income: '0.00', expense: '0.00', savingsRate: '0', daysToPayday: 0, avgIncome: '0.00', avgExpense: '0.00' };
+  if (!txs || !Array.isArray(txs) || txs.length === 0) return def;
+  try {
+    var list = txs.slice(0); // copy to avoid mutation
+    var now = new Date();
+    var currentMonth = now.getMonth();
+    var currentYear = now.getFullYear();
+    var currentMonthTxs = list.filter(function(t) {
+      var d = new Date(t.date);
+      return !isNaN(d.getTime()) && d.getMonth() === currentMonth && d.getFullYear() === currentYear;
+    });
+    var income = currentMonthTxs.filter(function(t) { return t.amount > 0; }).reduce(function(s, t) { return s + t.amount; }, 0);
+    var expense = Math.abs(currentMonthTxs.filter(function(t) { return t.amount < 0; }).reduce(function(s, t) { return s + t.amount; }, 0));
+    var totalBalance = list.reduce(function(s, t) { return s + t.amount; }, 0);
+    var savingsRate = income > 0 ? ((income - expense) / income) * 100 : 0;
+    var threeMonthsAgo = new Date();
+    threeMonthsAgo.setMonth(threeMonthsAgo.getMonth() - 3);
+    var recentTxs = list.filter(function(t) { return new Date(t.date) >= threeMonthsAgo; });
+    var monthsFound = recentTxs.length ? new Set(recentTxs.map(function(t) { return t.date.substring(0, 7); })).size : 1;
+    var totalRecentIncome = recentTxs.filter(function(t) { return t.amount > 0; }).reduce(function(s, t) { return s + t.amount; }, 0);
+    var totalRecentExpense = Math.abs(recentTxs.filter(function(t) { return t.amount < 0; }).reduce(function(s, t) { return s + t.amount; }, 0));
+    return {
+      balance: totalBalance.toFixed(2),
+      income: income.toFixed(2),
+      expense: expense.toFixed(2),
+      savingsRate: savingsRate.toFixed(1),
+      daysToPayday: _getDaysToPayday(),
+      avgIncome: (totalRecentIncome / monthsFound).toFixed(2),
+      avgExpense: (totalRecentExpense / monthsFound).toFixed(2)
+    };
+  } catch (e) {
+    if (typeof _logSystem === 'function') _logSystem('ERROR', '_calculateKPIs failed: ' + e.message, '_calculateKPIs', e.stack);
+    return def;
   }
-  
-  const now = new Date();
-  const currentMonth = now.getMonth();
-  const currentYear = now.getFullYear();
-  
-  // Current Month Data
-  const currentMonthTxs = txs.filter(t => {
-    const tDate = new Date(t.date);
-    return tDate.getMonth() === currentMonth && tDate.getFullYear() === currentYear;
-  });
-  
-  const income = currentMonthTxs.filter(t => t.amount > 0).reduce((s, t) => s + t.amount, 0);
-  const expense = Math.abs(currentMonthTxs.filter(t => t.amount < 0).reduce((s, t) => s + t.amount, 0));
-  const totalBalance = txs.reduce((s, t) => s + t.amount, 0); // Sum of all history
-  const savingsRate = income > 0 ? ((income - expense) / income) * 100 : 0;
-
-  // 3-Month Rolling Averages (for forecasting)
-  const threeMonthsAgo = new Date();
-  threeMonthsAgo.setMonth(threeMonthsAgo.getMonth() - 3);
-  
-  const recentTxs = txs.filter(t => new Date(t.date) >= threeMonthsAgo);
-  const monthsFound = new Set(recentTxs.map(t => t.date.substring(0, 7))).size || 1;
-  
-  const totalRecentIncome = recentTxs.filter(t => t.amount > 0).reduce((s, t) => s + t.amount, 0);
-  const totalRecentExpense = Math.abs(recentTxs.filter(t => t.amount < 0).reduce((s, t) => s + t.amount, 0));
-  
-  return {
-    balance: totalBalance.toFixed(2),
-    income: income.toFixed(2),
-    expense: expense.toFixed(2),
-    savingsRate: savingsRate.toFixed(1),
-    daysToPayday: _getDaysToPayday(),
-    avgIncome: (totalRecentIncome / monthsFound).toFixed(2), // Better for forecast
-    avgExpense: (totalRecentExpense / monthsFound).toFixed(2) // Better for forecast
-  };
 }
 
 /**
@@ -280,7 +309,8 @@ function _getDaysToPayday() {
  * Optional startDate, endDate (YYYY-MM-DD) to filter.
  */
 function _get3DMatrixData(startDateStr, endDateStr) {
-  var txs = _getTransactions();
+  var txResult = _getTransactions();
+  var txs = (txResult && txResult.transactions) ? txResult.transactions : [];
   if (startDateStr && endDateStr) {
     var start = new Date(startDateStr);
     var end = new Date(endDateStr);
@@ -290,10 +320,8 @@ function _get3DMatrixData(startDateStr, endDateStr) {
       return d >= start && d <= end;
     });
   }
-  
-  // 1. Aggregate spending by Category
-  const categorySpend = {};
-  txs.filter(t => t.amount < 0).forEach(t => {
+  var categorySpend = {};
+  txs.filter(function(t) { return t.amount < 0; }).forEach(function(t) {
     categorySpend[t.category] = (categorySpend[t.category] || 0) + Math.abs(t.amount);
   });
   
@@ -335,7 +363,8 @@ function _get3DMatrixData(startDateStr, endDateStr) {
  * Optional startDate, endDate (YYYY-MM-DD) to filter.
  */
 function _getSankeyData(startDateStr, endDateStr) {
-  var txs = _getTransactions();
+  var txResult = _getTransactions();
+  var txs = (txResult && txResult.transactions) ? txResult.transactions : [];
   if (startDateStr && endDateStr) {
     var start = new Date(startDateStr);
     var end = new Date(endDateStr);
@@ -400,8 +429,9 @@ function _getSankeyData(startDateStr, endDateStr) {
  * Smart budget suggestions based on last 3 months of spending.
  */
 function _getSmartBudgetSuggestions() {
-  const txs = _getTransactions();
-  const now = new Date();
+  var txResult = _getTransactions();
+  var txs = (txResult && txResult.transactions) ? txResult.transactions : [];
+  var now = new Date();
   const threeMonthsAgo = new Date();
   threeMonthsAgo.setMonth(now.getMonth() - 3);
 
@@ -443,8 +473,9 @@ function _getSmartBudgetSuggestions() {
  * Forecast using Rolling Averages
  */
 function _calculateForecast(adjustments) {
-  const txs = _getTransactions();
-  const kpis = _calculateKPIs(txs);
+  var txResult = _getTransactions();
+  var txs = (txResult && txResult.transactions) ? txResult.transactions : [];
+  var kpis = _calculateKPIs(txs);
   
   let balance = parseFloat(kpis.balance);
   
@@ -484,8 +515,9 @@ function _saveImportedTransactions(data) {
   if (!data || !data.length) return { success: false, count: 0 };
 
   // 1. Get existing transaction IDs for deduplication
-  const existingTx = _getTransactions();
-  const existingIds = new Set(existingTx.map(t => t.id));
+  var txResult = _getTransactions();
+  var existingTx = (txResult && txResult.transactions) ? txResult.transactions : [];
+  var existingIds = new Set(existingTx.map(function(t) { return t.id; }));
 
   // 2. Filter new data
   const newRows = [];
@@ -509,16 +541,21 @@ function _saveImportedTransactions(data) {
 
   if (newRows.length === 0) return { success: true, count: 0, message: "No new transactions to import." };
 
-  // 3. Save to Sheet
-  const settings = JSON.parse(_Config.getUserProp_(_Config.KEYS.SETTINGS_PROP_KEY) || '{"source":"active"}');
-  let ss;
-  
+  // 3. Save to Sheet (same effective settings as _getCoreTransactionData)
+  var settings = _Config.getEffectiveDataSettings_();
+  var ss;
   try {
     if (settings.source === 'external' && settings.externalId) {
       ss = SpreadsheetApp.openById(settings.externalId);
     } else {
-      ss = SpreadsheetApp.getActiveSpreadsheet();
+      try {
+        ss = SpreadsheetApp.getActiveSpreadsheet();
+      } catch (activeErr) {
+        var scriptId = PropertiesService.getScriptProperties().getProperty('SPREADSHEET_ID') || PropertiesService.getScriptProperties().getProperty(_Config.SCRIPT_KEY_DATA_SHEET_ID);
+        if (scriptId) ss = SpreadsheetApp.openById(scriptId);
+      }
     }
+    if (!ss) return { success: false, count: 0, message: "Database connection failed." };
   } catch (e) {
     return { success: false, count: 0, message: "Database connection failed." };
   }

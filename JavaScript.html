@@ -8,16 +8,77 @@
     chartInstances: {},
     modalChartInstance: null,
     currentTheme: localStorage.getItem('appTheme') || 'dark',
-    filters: { category: null, dateRange: null },
+    filters: { category: null },
+    dateRange: { start: null, end: null },
     pendingRequests: new Set(),
     toastQueue: [],
-    
-    // Safe state updates
     update(key, value) {
       this[key] = value;
       window.dispatchEvent(new CustomEvent('appstate-change', { detail: { key, value } }));
     }
   };
+
+  function getFilteredTransactions() {
+    var txs = AppState.data && Array.isArray(AppState.data.transactions) ? AppState.data.transactions : [];
+    var range = AppState.dateRange;
+    if (!range || !range.start || !range.end) return txs;
+    var start = new Date(range.start);
+    var end = new Date(range.end);
+    end.setHours(23, 59, 59);
+    return txs.filter(function(t) {
+      var d = new Date(t.date);
+      return d >= start && d <= end;
+    });
+  }
+
+  function getEffectiveKPIs() {
+    var full = AppState.data && Array.isArray(AppState.data.transactions) ? AppState.data.transactions : [];
+    var filtered = getFilteredTransactions();
+    var balance = full.reduce(function(s, t) { return s + t.amount; }, 0);
+    var income = filtered.filter(function(t) { return t.amount > 0; }).reduce(function(s, t) { return s + t.amount; }, 0);
+    var expense = Math.abs(filtered.filter(function(t) { return t.amount < 0; }).reduce(function(s, t) { return s + t.amount; }, 0));
+    var savingsRate = income > 0 ? ((income - expense) / income) * 100 : 0;
+    var serverKpis = AppState.data && AppState.data.kpis ? AppState.data.kpis : {};
+    return {
+      balance: balance.toFixed(2),
+      income: income.toFixed(2),
+      expense: expense.toFixed(2),
+      savingsRate: savingsRate.toFixed(1),
+      daysToPayday: serverKpis.daysToPayday != null ? serverKpis.daysToPayday : 0,
+      avgIncome: serverKpis.avgIncome || '0.00',
+      avgExpense: serverKpis.avgExpense || '0.00'
+    };
+  }
+
+  function updateFilteredSummaryUI() {
+    var range = AppState.dateRange;
+    var summaryEl = document.getElementById('filtered-summary');
+    if (!summaryEl) return;
+    if (!range || !range.start || !range.end) {
+      summaryEl.style.display = 'none';
+      return;
+    }
+    var txs = getFilteredTransactions();
+    var income = txs.filter(function(t) { return t.amount > 0; }).reduce(function(s, t) { return s + t.amount; }, 0);
+    var expense = txs.filter(function(t) { return t.amount < 0; }).reduce(function(s, t) { return s + Math.abs(t.amount); }, 0);
+    var balance = income - expense;
+    document.getElementById('filtered-count').innerText = txs.length;
+    var balanceEl = document.getElementById('filtered-balance');
+    if (balanceEl) { balanceEl.innerText = '£' + balance.toFixed(2); balanceEl.style.color = balance >= 0 ? 'var(--success)' : 'var(--danger)'; }
+    var incomeEl = document.getElementById('filtered-income');
+    if (incomeEl) incomeEl.innerText = '£' + income.toFixed(2);
+    var expenseEl = document.getElementById('filtered-expense');
+    if (expenseEl) expenseEl.innerText = '£' + expense.toFixed(2);
+    summaryEl.style.display = 'block';
+  }
+
+  function refreshDateDrivenViews() {
+    if (!AppState.data) return;
+    updateKPIs(getEffectiveKPIs());
+    renderDashboardCharts();
+    if (document.getElementById('calendar')) initializeCalendar();
+    updateFilteredSummaryUI();
+  }
 
   // ============================================
   // ERROR BOUNDARY & SAFE EXECUTION
@@ -199,90 +260,118 @@
   async function loadDashboardData(forceRefresh = false) {
     const cacheKey = 'dashboardData';
     const cacheTime = 5 * 60 * 1000; // 5 minutes
-    
-    // Check cache
+
+    // Don't use cache if it was empty/error (so KPIs can refresh when data is now available)
     if (!forceRefresh) {
       const cached = sessionStorage.getItem(cacheKey);
       if (cached) {
         try {
-          const { data, timestamp } = JSON.parse(cached);
-          if (Date.now() - timestamp < cacheTime) {
+          const parsed = JSON.parse(cached);
+          const data = parsed.data;
+          const timestamp = parsed.timestamp || 0;
+          const isEmpty = !data || !Array.isArray(data.transactions) || data.transactions.length === 0 || data._error;
+          if (Date.now() - timestamp < cacheTime && !isEmpty) {
             processDashboardData(data);
             return;
           }
-        } catch (e) {
-          // Invalid cache, ignore
-        }
+        } catch (e) {}
       }
     }
 
-    // Load fresh data with retry
+    // Load fresh data with retry (pass forceRefresh so server bypasses its cache when needed)
     let retries = 3;
     while (retries > 0) {
       try {
-        const data = await new Promise((resolve, reject) => {
+        const response = await new Promise((resolve, reject) => {
           google.script.run
             .withSuccessHandler(resolve)
             .withFailureHandler(reject)
-            .getDashboardData();
+            .getDashboardData(forceRefresh);
         });
-        
-        // Cache the data
-        sessionStorage.setItem(cacheKey, JSON.stringify({
-          data,
-          timestamp: Date.now()
-        }));
-        
+        if (!response || typeof response !== 'object') throw new Error('Invalid response');
+        var data = response.data || {};
+        if (!Array.isArray(data.transactions)) data.transactions = [];
+        if (!data.kpis || typeof data.kpis !== 'object') data.kpis = { balance: '0.00', income: '0.00', expense: '0.00', savingsRate: '0', daysToPayday: 0, avgIncome: '0.00', avgExpense: '0.00' };
+        if (!forceRefresh && response.success) sessionStorage.setItem(cacheKey, JSON.stringify({ data: data, timestamp: Date.now() }));
         processDashboardData(data);
+        showOrHideNoDataBanner();
+        if (data.transactions && data.transactions.length > 0) window._noDataToastShown = false;
+        if (!response.success && response.error) showToast(response.error, 'warning', 8000);
+        if (response.meta && response.meta.validation && (response.meta.validation.warnings || []).length) {
+          response.meta.validation.warnings.forEach(function(w) { showToast(w, 'info', 4000); });
+        }
         return;
       } catch (error) {
         retries--;
         if (retries === 0) {
-          showError('Failed to load data after multiple attempts');
-          showLoader(false);
+          showError('Failed to load data. Open the spreadsheet once from Google Drive and run Initialize System from the menu, then refresh.');
+          processDashboardData({
+            transactions: [],
+            settings: {},
+            budgets: {},
+            nw: { assets: [], liabilities: [] },
+            goals: [],
+            kpis: { balance: '0.00', income: '0.00', expense: '0.00', savingsRate: '0', daysToPayday: 0, avgIncome: '0.00', avgExpense: '0.00' }
+          });
+          showOrHideNoDataBanner();
         } else {
-          await new Promise(r => setTimeout(r, 1000)); // Wait 1s before retry
+          await new Promise(r => setTimeout(r, 1000));
         }
       }
     }
+    showLoader(false);
   }
 
   function processDashboardData(data) {
+    if (!data) return;
     AppState.update('data', data);
-    updateKPIs(data.kpis);
+    setDefaultDateRange();
+    updateKPIs(getEffectiveKPIs());
     renderDashboardCharts();
     initializeCalendar();
     initializeNetWorth();
+    updateFilteredSummaryUI();
+    showOrHideNoDataBanner();
+  }
+
+  function showOrHideNoDataBanner() {
+    var banner = document.getElementById('no-data-banner');
+    if (!banner) return;
+    var hasData = AppState.data && Array.isArray(AppState.data.transactions) && AppState.data.transactions.length > 0;
+    banner.style.display = hasData ? 'none' : 'block';
+  }
+
+  function setDefaultDateRange() {
+    var startEl = document.getElementById('start-date');
+    var endEl = document.getElementById('end-date');
+    if (!startEl || !endEl) return;
+    if (startEl.value && endEl.value) return;
+    var today = new Date();
+    var start = new Date(today.getFullYear(), today.getMonth(), 1);
+    startEl.value = start.getFullYear() + '-' + String(start.getMonth() + 1).padStart(2, '0') + '-' + String(start.getDate()).padStart(2, '0');
+    endEl.value = today.getFullYear() + '-' + String(today.getMonth() + 1).padStart(2, '0') + '-' + String(today.getDate()).padStart(2, '0');
   }
 
   function updateKPIs(kpis) {
-    if (!kpis) return;
-    
-    const kpiElements = {
+    var kpiElements = {
       balance: 'kpi-balance',
       income: 'kpi-income',
       expense: 'kpi-expense',
       savingsRate: 'kpi-savings'
     };
-
-    Object.entries(kpiElements).forEach(([key, id]) => {
-      const element = document.getElementById(id);
-      if (!element) return;
-
+    if (!kpis) kpis = { balance: '0.00', income: '0.00', expense: '0.00', savingsRate: '0' };
+    Object.keys(kpiElements).forEach(function(key) {
+      var id = kpiElements[key];
+      var el = document.getElementById(id);
+      if (!el) return;
+      var val = kpis[key];
       if (key === 'savingsRate') {
-        element.innerText = kpis[key] + '%';
-      } else {
-        try {
-          new countUp.CountUp(id, parseFloat(kpis[key]), {
-            prefix: '£',
-            decimalPlaces: 2,
-            duration: 2,
-            enableScrollSpy: true
-          }).start();
-        } catch (e) {
-          element.innerText = `£${parseFloat(kpis[key]).toFixed(2)}`;
-        }
+        el.innerText = (val != null ? val : 0) + '%';
+        return;
       }
+      var num = parseFloat(val);
+      if (isNaN(num)) num = 0;
+      el.innerText = '£' + num.toFixed(2);
     });
   }
 
@@ -298,7 +387,8 @@
       AppState.calendar.destroy();
     }
 
-    const events = AppState.data.transactions.map(t => ({
+    var rangeTx = getFilteredTransactions();
+    const events = rangeTx.map(t => ({
       id: `tx-${t.date}-${t.description}-${Math.random()}`,
       title: `${t.description} (${t.category})`,
       start: t.date,
@@ -358,10 +448,10 @@
   }
 
   function renderSparkline(date, cellEl) {
-    if (!AppState.data?.transactions) return;
-    
+    var rangeTx = getFilteredTransactions();
+    if (!rangeTx.length) return;
     const dateStr = date.toISOString().split('T')[0];
-    const dayTxs = AppState.data.transactions.filter(t => t.date === dateStr);
+    const dayTxs = rangeTx.filter(t => t.date === dateStr);
     if (dayTxs.length === 0) return;
 
     const totals = dayTxs.reduce((acc, t) => {
@@ -398,10 +488,8 @@
   // ============================================
   function showDayTransactions(dateStr, jsEvent) {
     if (!AppState.data) return;
-    
-    const dayTxs = AppState.data.transactions
-      .filter(t => t.date === dateStr)
-      .sort((a, b) => Math.abs(b.amount) - Math.abs(a.amount));
+    var rangeTx = getFilteredTransactions();
+    const dayTxs = rangeTx.filter(t => t.date === dateStr).sort((a, b) => Math.abs(b.amount) - Math.abs(a.amount));
 
     if (dayTxs.length === 0) return;
 
@@ -521,37 +609,29 @@
       showError('No data available');
       return;
     }
-
-    const now = new Date();
-    const currentMonthTxs = AppState.data.transactions.filter(t => {
-      try {
-        const d = new Date(t.date);
-        return !isNaN(d) && d.getMonth() === now.getMonth() && 
-               d.getFullYear() === now.getFullYear();
-      } catch (e) {
-        return false;
-      }
-    });
+    var rangeTx = getFilteredTransactions();
+    var balanceTx = AppState.data.transactions;
+    var rangeLabel = AppState.dateRange && AppState.dateRange.start && AppState.dateRange.end ? ' (selected range)' : '';
 
     let content = '';
     switch(type) {
       case 'balance':
         titleEl.textContent = 'Balance History';
-        content = generateBalanceView();
+        content = generateBalanceView(balanceTx);
         break;
       case 'income':
-        titleEl.textContent = 'Monthly Income';
-        const incomeTxs = currentMonthTxs.filter(t => t.amount > 0);
+        titleEl.textContent = 'Income' + rangeLabel;
+        const incomeTxs = rangeTx.filter(t => t.amount > 0);
         content = generateIncomeView(incomeTxs);
         break;
       case 'expenses':
-        titleEl.textContent = 'Monthly Expenses';
-        const expenseTxs = currentMonthTxs.filter(t => t.amount < 0);
+        titleEl.textContent = 'Expenses' + rangeLabel;
+        const expenseTxs = rangeTx.filter(t => t.amount < 0);
         content = generateExpenseView(expenseTxs);
         break;
       case 'savings':
-        titleEl.textContent = 'Savings Analysis';
-        content = generateSavingsView(currentMonthTxs);
+        titleEl.textContent = 'Savings Analysis' + rangeLabel;
+        content = generateSavingsView(rangeTx);
         break;
       default:
         titleEl.textContent = 'Details';
@@ -560,41 +640,28 @@
 
     bodyEl.innerHTML = content;
     modal.style.display = 'block';
-    
-    // Initialize chart if needed
     if (type === 'income' || type === 'expenses') {
-      setTimeout(() => {
-        const canvas = document.getElementById('modal-chart');
+      setTimeout(function() {
+        var canvas = document.getElementById('modal-chart');
         if (canvas) {
-          const data = type === 'income' ? 
-            currentMonthTxs.filter(t => t.amount > 0) : 
-            currentMonthTxs.filter(t => t.amount < 0);
+          var data = type === 'income' ? rangeTx.filter(function(t) { return t.amount > 0; }) : rangeTx.filter(function(t) { return t.amount < 0; });
           renderCategoryChart(data);
         }
       }, 100);
     }
   }
 
-  function generateBalanceView() {
-    if (!AppState.data?.transactions) return '<p>No data</p>';
-    
-    // Sort by date
-    const sorted = [...AppState.data.transactions]
-      .sort((a, b) => new Date(a.date) - new Date(b.date));
-    
-    let running = 0;
+  function generateBalanceView(fullTransactions) {
+    var txs = fullTransactions || (AppState.data && AppState.data.transactions) || [];
+    if (!txs.length) return '<p>No data</p>';
+    var sorted = txs.slice().sort(function(a, b) { return new Date(a.date) - new Date(b.date); });
+    var running = 0;
     const balancePoints = sorted.map(t => {
       running += t.amount;
       return { date: t.date, balance: running };
     });
-    
-    // Calculate statistics
-    const totalIncome = AppState.data.transactions
-      .filter(t => t.amount > 0)
-      .reduce((s, t) => s + t.amount, 0);
-    const totalExpense = AppState.data.transactions
-      .filter(t => t.amount < 0)
-      .reduce((s, t) => s + Math.abs(t.amount), 0);
+    const totalIncome = txs.filter(t => t.amount > 0).reduce((s, t) => s + t.amount, 0);
+    const totalExpense = txs.filter(t => t.amount < 0).reduce((s, t) => s + Math.abs(t.amount), 0);
     const currentBalance = running;
     
     const highest = Math.max(...balancePoints.map(p => p.balance));
@@ -903,7 +970,62 @@
   }
 
   // ============================================
-  // CHART RENDERING (PLOTLY)
+  // CLIENT-SIDE CHART DATA (driven by date range)
+  // ============================================
+  function buildSankeyFromTransactions(txs) {
+    var MIN = 50;
+    var incomeMap = {};
+    txs.filter(function(t) { return t.amount > 0; }).forEach(function(t) {
+      incomeMap[t.description] = (incomeMap[t.description] || 0) + t.amount;
+    });
+    var expenseMap = {};
+    txs.filter(function(t) { return t.amount < 0; }).forEach(function(t) {
+      expenseMap[t.category] = (expenseMap[t.category] || 0) + Math.abs(t.amount);
+    });
+    var incomeLabels = Object.keys(incomeMap).filter(function(k) { return incomeMap[k] > MIN; });
+    var expenseLabels = Object.keys(expenseMap);
+    var labels = incomeLabels.concat(['💰 Total Income']).concat(expenseLabels);
+    var sources = [], targets = [], values = [];
+    var totalIdx = incomeLabels.length;
+    incomeLabels.forEach(function(_, i) {
+      sources.push(i);
+      targets.push(totalIdx);
+      values.push(incomeMap[incomeLabels[i]]);
+    });
+    expenseLabels.forEach(function(_, i) {
+      sources.push(totalIdx);
+      targets.push(totalIdx + 1 + i);
+      values.push(expenseMap[expenseLabels[i]]);
+    });
+    return { labels: labels, sources: sources, targets: targets, values: values };
+  }
+
+  function build3DMatrixFromTransactions(txs) {
+    var categorySpend = {};
+    txs.filter(function(t) { return t.amount < 0; }).forEach(function(t) {
+      categorySpend[t.category] = (categorySpend[t.category] || 0) + Math.abs(t.amount);
+    });
+    var categories = Object.keys(categorySpend).sort(function(a, b) { return categorySpend[b] - categorySpend[a]; }).slice(0, 8);
+    var months = [], monthKeys = [];
+    for (var i = 5; i >= 0; i--) {
+      var d = new Date();
+      d.setMonth(d.getMonth() - i);
+      months.push(d.toLocaleString('default', { month: 'short', year: '2-digit' }));
+      monthKeys.push(d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0'));
+    }
+    var z = months.map(function() { return categories.map(function() { return 0; }); });
+    txs.forEach(function(t) {
+      if (t.amount >= 0) return;
+      var key = t.date.substring(0, 7);
+      var monthIdx = monthKeys.indexOf(key);
+      var catIdx = categories.indexOf(t.category);
+      if (monthIdx !== -1 && catIdx !== -1) z[monthIdx][catIdx] += Math.abs(t.amount);
+    });
+    return { x: categories, y: months, z: z };
+  }
+
+  // ============================================
+  // CHART RENDERING (PLOTLY) – uses getFilteredTransactions()
   // ============================================
   function renderDashboardCharts() {
     renderSankeyChart();
@@ -912,69 +1034,47 @@
   }
 
   function renderSankeyChart() {
-    const chartId = 'chart-sankey';
-    safeExecute(async () => {
-      const data = await new Promise((resolve, reject) => {
-        google.script.run
-          .withSuccessHandler(resolve)
-          .withFailureHandler(reject)
-          .fetchSankeyData();
-      });
-
-      if (!data?.labels?.length) return;
-
-      const trace = {
-        type: "sankey",
-        orientation: "h",
+    var chartId = 'chart-sankey';
+    var txs = getFilteredTransactions();
+    var data = buildSankeyFromTransactions(txs);
+    if (!data.labels.length) {
+      document.getElementById(chartId).innerHTML = '<p style="color:var(--text-dim);padding:40px;text-align:center;">No data for selected range.</p>';
+      return;
+    }
+    safeExecute(function() {
+      var totalIdx = data.labels.indexOf('💰 Total Income');
+      var trace = {
+        type: 'sankey',
+        orientation: 'h',
         node: {
           pad: 15,
           thickness: 20,
           label: data.labels,
-          color: data.labels.map((l, i) => {
-            if (l.includes('Total Income')) return '#00d2ff';
-            if (i < data.labels.indexOf(l.includes('Total Income') ? l : '')) return 'rgba(0, 255, 136, 0.8)';
+          color: data.labels.map(function(l, i) {
+            if (i === totalIdx) return '#00d2ff';
+            if (i < totalIdx) return 'rgba(0, 255, 136, 0.8)';
             return 'rgba(255, 77, 77, 0.8)';
           }),
           line: { color: 'rgba(255,255,255,0.2)', width: 0.5 },
           hoverinfo: 'all'
         },
-        link: {
-          source: data.sources,
-          target: data.targets,
-          value: data.values,
-          color: 'rgba(255,255,255,0.1)'
-        }
+        link: { source: data.sources, target: data.targets, value: data.values, color: 'rgba(255,255,255,0.1)' }
       };
-
-      const layout = {
-        font: { size: 12, color: "#fff" },
-        paper_bgcolor: "rgba(0,0,0,0)",
-        plot_bgcolor: "rgba(0,0,0,0)",
-        margin: { l: 20, r: 20, t: 20, b: 20 },
-        hoverlabel: { bgcolor: "rgba(0,0,0,0.8)", font: { color: "#fff" } }
-      };
-
-      await Plotly.newPlot(chartId, [trace], layout, { 
-        responsive: true, 
-        displayModeBar: false,
-        showSendToCloud: false
-      });
-      
+      var layout = { font: { size: 12, color: '#fff' }, paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)', margin: { l: 20, r: 20, t: 20, b: 20 }, hoverlabel: { bgcolor: 'rgba(0,0,0,0.8)', font: { color: '#fff' } } };
+      Plotly.newPlot(chartId, [trace], layout, { responsive: true, displayModeBar: false, showSendToCloud: false });
       AppState.chartInstances[chartId] = true;
     }, null, 'Failed to render Sankey chart');
   }
 
   function render3DMatrix() {
-    const chartId = 'chart-3d';
-    safeExecute(async () => {
-      const data = await new Promise((resolve, reject) => {
-        google.script.run
-          .withSuccessHandler(resolve)
-          .withFailureHandler(reject)
-          .getMatrixData();
-      });
-
-      if (!data?.x?.length) return;
+    var chartId = 'chart-3d';
+    var txs = getFilteredTransactions();
+    var data = build3DMatrixFromTransactions(txs);
+    if (!data.x.length) {
+      document.getElementById(chartId).innerHTML = '<p style="color:var(--text-dim);padding:40px;text-align:center;">No data for selected range.</p>';
+      return;
+    }
+    safeExecute(function() {
 
       const trace = {
         x: data.x,
@@ -1021,31 +1121,33 @@
         }
       };
 
-      await Plotly.newPlot(chartId, [trace], layout, { 
-        responsive: true,
-        displayModeBar: false
-      });
-      
+      Plotly.newPlot(chartId, [trace], layout, { responsive: true, displayModeBar: false });
       AppState.chartInstances[chartId] = true;
     }, null, 'Failed to render 3D chart');
   }
 
   function renderRunningBalance() {
-    const chartId = 'chart-running-balance';
-    if (!AppState.data?.transactions) return;
-
-    const txs = [...AppState.data.transactions]
-      .sort((a, b) => new Date(a.date) - new Date(b.date));
-    
-    let running = 0;
-    const balanceData = txs.map(t => {
+    var chartId = 'chart-running-balance';
+    var container = document.getElementById(chartId);
+    if (!container) return;
+    if (!AppState.data || !Array.isArray(AppState.data.transactions)) {
+      container.innerHTML = '<p style="color:var(--text-dim);padding:40px;text-align:center;">No transaction data. Add data to the sheet or run Initialize System.</p>';
+      return;
+    }
+    var txs = getFilteredTransactions();
+    txs = txs.length ? txs.slice().sort(function(a, b) { return new Date(a.date) - new Date(b.date); }) : [];
+    var running = 0;
+    const balanceData = txs.map(function(t) {
       running += t.amount;
       return { date: t.date, balance: running };
     });
-
+    if (balanceData.length === 0) {
+      container.innerHTML = '<p style="color:var(--text-dim);padding:40px;text-align:center;">No transaction data yet.</p>';
+      return;
+    }
     const trace = {
-      x: balanceData.map(d => d.date),
-      y: balanceData.map(d => d.balance),
+      x: balanceData.map(function(d) { return d.date; }),
+      y: balanceData.map(function(d) { return d.balance; }),
       type: 'scatter',
       mode: 'lines',
       line: { color: '#00d2ff', width: 3, shape: 'spline' },
@@ -1602,6 +1704,95 @@
   }
 
   // ============================================
+  // LABS: diagnostics, health check, logs
+  // ============================================
+  function scriptRunWithTimeout(fnName, timeoutMs) {
+    timeoutMs = timeoutMs || 30000;
+    return new Promise(function(resolve, reject) {
+      var resolved = false;
+      var t = setTimeout(function() {
+        if (resolved) return;
+        resolved = true;
+        reject(new Error('Request timed out after ' + (timeoutMs / 1000) + 's'));
+      }, timeoutMs);
+      google.script.run
+        .withSuccessHandler(function(result) {
+          if (resolved) return;
+          resolved = true;
+          clearTimeout(t);
+          resolve(result);
+        })
+        .withFailureHandler(function(err) {
+          if (resolved) return;
+          resolved = true;
+          clearTimeout(t);
+          reject(err);
+        })[fnName].apply(google.script.run, Array.prototype.slice.call(arguments, 2));
+    });
+  }
+  function runHealthCheckFromLabs() {
+    var el = document.getElementById('labs-connection');
+    if (el) el.innerHTML = 'Running health check...';
+    google.script.run
+      .withSuccessHandler(function(r) {
+        var el = document.getElementById('labs-connection');
+        if (!el) return;
+        el.innerHTML = 'Health check: ' + (r.success ? 'OK' : 'FAILED') + (r.message ? ' – ' + r.message : '') + (r.rowCount !== undefined ? ' (rows: ' + r.rowCount + ')' : '');
+        el.style.color = r.success ? 'var(--success)' : 'var(--danger)';
+      })
+      .withFailureHandler(function(err) {
+        var el = document.getElementById('labs-connection');
+        if (el) { el.innerHTML = 'Health check error: ' + (err && err.message ? err.message : err); el.style.color = 'var(--danger)'; }
+      })
+      .checkDataConnection();
+  }
+  function runTestFromLabs() {
+    showToast('Running testGetDashboardData...', 'info');
+    google.script.run
+      .withSuccessHandler(function(r) {
+        showToast(r.success ? 'Test passed. Check Apps Script logs.' : 'Test failed: ' + (r.error || ''), r.success ? 'success' : 'error');
+      })
+      .withFailureHandler(function(err) { showToast('Test error: ' + (err && err.message ? err.message : err), 'error'); })
+      .testGetDashboardData();
+  }
+  function refreshLabsLogs() {
+    google.script.run
+      .withSuccessHandler(function(r) {
+        var pre = document.getElementById('labs-log-entries');
+        if (!pre) return;
+        if (!r.success || !r.entries || !r.entries.length) { pre.textContent = r.error || 'No log entries.'; return; }
+        pre.textContent = r.entries.slice().reverse().map(function(e) {
+          return (e.t || '') + ' [' + (e.level || '') + '] ' + (e.source || '') + ': ' + (e.message || '') + (e.detail ? ' | ' + e.detail : '');
+        }).join('\n');
+      })
+      .withFailureHandler(function() {
+        var pre = document.getElementById('labs-log-entries');
+        if (pre) pre.textContent = 'Failed to load logs.';
+      })
+      .getSystemLogEntries();
+  }
+  function runLabsDiagnostics() {
+    google.script.run
+      .withSuccessHandler(function(d) {
+        var el = document.getElementById('labs-connection');
+        if (!el) return;
+        var s = 'Connection: ' + (d.connection && d.connection.success ? 'OK' : 'FAIL') + (d.connection && d.connection.message ? ' – ' + d.connection.message : '');
+        if (d.lastError) s += '\nLast error: ' + (d.lastError.message || '') + ' @ ' + (d.lastError.source || '');
+        if (d.cacheAgeMs != null) s += '\nCache age: ' + Math.round(d.cacheAgeMs / 1000) + 's';
+        el.innerHTML = s.replace(/\n/g, '<br>');
+        el.style.color = (d.connection && d.connection.success) ? 'var(--success)' : 'var(--danger)';
+      })
+      .withFailureHandler(function(err) {
+        var el = document.getElementById('labs-connection');
+        if (el) { el.innerHTML = 'Diagnostics error: ' + (err && err.message ? err.message : err); el.style.color = 'var(--danger)'; }
+      })
+      .getDiagnostics();
+  }
+  window.runHealthCheckFromLabs = runHealthCheckFromLabs;
+  window.runTestFromLabs = runTestFromLabs;
+  window.refreshLabsLogs = refreshLabsLogs;
+
+  // ============================================
   // PAGE NAVIGATION
   // ============================================
   function showPage(pageId) {
@@ -1639,6 +1830,10 @@
           
         case 'networth':
           calculateNetWorthTotal();
+          break;
+        case 'labs':
+          refreshLabsLogs();
+          if (document.getElementById('labs-diagnostics-toggle') && document.getElementById('labs-diagnostics-toggle').checked) runLabsDiagnostics();
           break;
       }
     }
@@ -1757,14 +1952,12 @@
 // DATE RANGE FILTER (Integrated with AppState)
 // ============================================
 (function() {
-  // Store filtered data separately (not replacing AppState.data)
-  let filteredData = null;
-
-  // Expose functions globally
   window.setQuickRange = function(range) {
+    const startEl = document.getElementById('start-date');
+    const endEl = document.getElementById('end-date');
+    if (!startEl || !endEl) return;
     const today = new Date();
     let startDate = new Date();
-    
     switch(range) {
       case 'month':
         startDate = new Date(today.getFullYear(), today.getMonth(), 1);
@@ -1777,13 +1970,11 @@
         startDate = new Date(today.getFullYear(), 0, 1);
         break;
       case 'all':
-        startDate = new Date(2000, 0, 1); // Far past
+        startDate = new Date(2000, 0, 1);
         break;
     }
-    
-    document.getElementById('start-date').value = formatDateForInput(startDate);
-    document.getElementById('end-date').value = formatDateForInput(today);
-    
+    startEl.value = formatDateForInput(startDate);
+    endEl.value = formatDateForInput(today);
     applyDateFilter();
   };
 
@@ -1795,151 +1986,41 @@
   };
 
   window.applyDateFilter = function() {
-    if (!AppState.data || !AppState.data.transactions) {
-      showToast('No data to filter', 'warning');
+    if (!AppState.data || !Array.isArray(AppState.data.transactions) || AppState.data.transactions.length === 0) {
+      if (!window._noDataToastShown) {
+        window._noDataToastShown = true;
+        showToast('Load data first: open the spreadsheet, run Initialize System, then click Sync from source.', 'warning', 6000);
+      }
       return;
     }
-    
-    const startDate = document.getElementById('start-date').value;
-    const endDate = document.getElementById('end-date').value;
-    
+    var startEl = document.getElementById('start-date');
+    var endEl = document.getElementById('end-date');
+    if (!startEl || !endEl) {
+      showToast('Date filter UI not available', 'warning');
+      return;
+    }
+    var startDate = startEl.value;
+    var endDate = endEl.value;
     if (!startDate || !endDate) {
       showToast('Please select both start and end dates', 'warning');
       return;
     }
-    
-    const start = new Date(startDate);
-    const end = new Date(endDate);
-    end.setHours(23, 59, 59); // include entire end day
-    
-    // Filter transactions
-    filteredData = AppState.data.transactions.filter(t => {
-      const tDate = new Date(t.date);
-      return tDate >= start && tDate <= end;
-    });
-    
-    // Update summary UI
-    updateFilteredSummary();
-    
-    // Re-render relevant charts using the filtered data
-    renderFilteredCharts();
-    
-    document.getElementById('filtered-summary').style.display = 'block';
-    showToast(`Showing ${filteredData.length} transactions`, 'success');
+    AppState.dateRange = { start: startDate, end: endDate };
+    refreshDateDrivenViews();
+    var count = getFilteredTransactions().length;
+    showToast('Showing ' + count + ' transactions in range', 'success');
   };
 
-  function updateFilteredSummary() {
-    if (!filteredData) return;
-    
-    const income = filteredData.filter(t => t.amount > 0)
-      .reduce((s, t) => s + t.amount, 0);
-    const expense = filteredData.filter(t => t.amount < 0)
-      .reduce((s, t) => s + Math.abs(t.amount), 0);
-    const balance = income - expense;
-    
-    document.getElementById('filtered-balance').innerText = `£${balance.toFixed(2)}`;
-    document.getElementById('filtered-income').innerText = `£${income.toFixed(2)}`;
-    document.getElementById('filtered-expense').innerText = `£${expense.toFixed(2)}`;
-    document.getElementById('filtered-count').innerText = filteredData.length;
-    
-    document.getElementById('filtered-balance').style.color = 
-      balance >= 0 ? 'var(--success)' : 'var(--danger)';
-  }
-
-  function renderFilteredCharts() {
-    if (!filteredData) return;
-
-    // Create a temporary data object for chart rendering
-    const filteredAppData = {
-      ...AppState.data,
-      transactions: filteredData
-    };
-
-    // Re-render the running balance chart (it uses AppState.data directly)
-    // We'll temporarily override AppState.data for this call
-    const originalData = AppState.data;
-    AppState.data = filteredAppData;
-    renderRunningBalance();  // this function reads AppState.data
-    AppState.data = originalData;
-
-    // For Sankey and 3D matrix, we need to fetch filtered data from server
-    // The cleanest approach: call server with date parameters
-    const startDate = document.getElementById('start-date').value;
-    const endDate = document.getElementById('end-date').value;
-
-    google.script.run
-      .withSuccessHandler(function(data) {
-        if (!data?.labels?.length) return;
-        const trace = {
-          type: "sankey",
-          orientation: "h",
-          node: {
-            pad: 15,
-            thickness: 20,
-            label: data.labels,
-            color: data.labels.map((l, i) => {
-              if (l.includes('Total Income')) return '#00d2ff';
-              if (i < data.labels.indexOf(l.includes('Total Income') ? l : '')) 
-                return 'rgba(0, 255, 136, 0.8)';
-              return 'rgba(255, 77, 77, 0.8)';
-            })
-          },
-          link: {
-            source: data.sources,
-            target: data.targets,
-            value: data.values,
-            color: 'rgba(255,255,255,0.1)'
-          }
-        };
-        Plotly.react('chart-sankey', [trace], {
-          paper_bgcolor: 'rgba(0,0,0,0)',
-          font: { color: '#fff' }
-        });
-      })
-      .withFailureHandler(function(err) { showToast('Failed to load filtered Sankey', 'error'); })
-      .fetchSankeyData(startDate, endDate);
-
-    google.script.run
-      .withSuccessHandler(function(data) {
-        if (!data?.x?.length) return;
-        const trace = {
-          x: data.x,
-          y: data.y,
-          z: data.z,
-          type: 'surface',
-          colorscale: [
-            [0, '#020024'],
-            [0.3, '#090979'],
-            [0.6, '#00d2ff'],
-            [1, '#00ff88']
-          ]
-        };
-        Plotly.react('chart-3d', [trace], {
-          paper_bgcolor: 'rgba(0,0,0,0)',
-          scene: {
-            xaxis: { tickfont: { color: '#ccc' } },
-            yaxis: { tickfont: { color: '#ccc' } },
-            zaxis: { tickfont: { color: '#ccc' } }
-          }
-        });
-      })
-      .withFailureHandler(function(err) { showToast('Failed to load filtered 3D data', 'error'); })
-      .getMatrixData(startDate, endDate);
-  }
-
   window.clearFilter = function() {
-    filteredData = null;
-    document.getElementById('filtered-summary').style.display = 'none';
-    document.getElementById('start-date').value = '';
-    document.getElementById('end-date').value = '';
-    
-    // Restore original charts (by re-initializing with full data)
-    renderDashboardCharts();  // this uses AppState.data
-    if (AppState.calendar) {
-      // You may want to refresh calendar events here
-      initializeCalendar();  // re-creates calendar with full data
-    }
-    showToast('Filter cleared', 'info');
+    AppState.dateRange = { start: null, end: null };
+    var summaryEl = document.getElementById('filtered-summary');
+    var startEl = document.getElementById('start-date');
+    var endEl = document.getElementById('end-date');
+    if (summaryEl) summaryEl.style.display = 'none';
+    if (startEl) startEl.value = '';
+    if (endEl) endEl.value = '';
+    refreshDateDrivenViews();
+    showToast('Showing all data', 'info');
   };
 })();
 // ============================================
@@ -1954,17 +2035,16 @@
     const syncBtn = document.getElementById('sync-button');
     const syncIcon = document.getElementById('sync-icon');
     const lastSyncEl = document.getElementById('last-sync-time');
-    
-    if (!syncBtn || !syncIcon) return;
+    if (!syncBtn) return;
     
     if (isSyncing) {
       syncBtn.disabled = true;
       syncBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Syncing...';
-      syncIcon.className = 'fas fa-spinner fa-spin';
+      if (syncIcon) syncIcon.className = 'fas fa-spinner fa-spin';
     } else {
       syncBtn.disabled = false;
       syncBtn.innerHTML = '<i class="fas fa-sync-alt"></i> Sync Now';
-      syncIcon.className = 'fas fa-sync-alt';
+      if (syncIcon) syncIcon.className = 'fas fa-sync-alt';
     }
     
     if (lastSyncEl && lastSyncTime) {
@@ -1984,30 +2064,24 @@
     showLoader(true);
     
     try {
-      // Force refresh data using existing function (it returns a promise-like)
+      // Force refresh: bypass both client and server caches
       await new Promise((resolve, reject) => {
         google.script.run
           .withSuccessHandler(resolve)
           .withFailureHandler(reject)
-          .getDashboardData(); // This should return the full data object
-      }).then(data => {
-        // Update AppState and UI
+          .getDashboardData(true);
+      }).then(function(response) {
+        var data = (response && response.data) ? response.data : response;
+        if (!data) return;
         AppState.update('data', data);
         updateKPIs(data.kpis);
         renderDashboardCharts();
-        initializeCalendar();  // re-creates calendar with new data
+        initializeCalendar();
         initializeNetWorth();
-        
-        // Update last sync time
         lastSyncTime = new Date().toLocaleString();
         localStorage.setItem('lastSyncTime', lastSyncTime);
-        
-        // Refresh budget view if visible
-        if (document.getElementById('budgets-view')?.style.display === 'block') {
-          loadSmartSuggestions();
-        }
-        
-        showToast('Dashboard synced successfully!', 'success');
+        if (document.getElementById('budgets-view') && document.getElementById('budgets-view').style.display === 'block') loadSmartSuggestions();
+        showToast(response.success !== false ? 'Dashboard synced successfully!' : (response.error || 'Synced with warnings'), response.success !== false ? 'success' : 'warning');
       });
     } catch (error) {
       showError('Sync failed: ' + error.message);

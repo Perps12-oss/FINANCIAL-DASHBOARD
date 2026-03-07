@@ -20,21 +20,57 @@
       <div class="nav-item" onclick="showPage('forecast')"><i class="fas fa-chart-line"></i><span>Forecast</span></div>
       <div class="nav-item" onclick="showPage('networth')"><i class="fas fa-landmark"></i><span>Net Worth</span></div>
       <div class="nav-item" onclick="showPage('settings')"><i class="fas fa-cog"></i><span>Settings</span></div>
+      <div class="nav-item" onclick="showPage('labs')"><i class="fas fa-flask"></i><span>Labs</span></div>
       <div class="nav-item import-btn" onclick="openImportWizard()"><i class="fas fa-file-import"></i><span>Import</span></div>
     </nav>
 
     <!-- Main Content -->
     <main class="content">
       <!-- KPI Header -->
-      <header class="kpi-header">
+      <header class="kpi-header" style="grid-template-columns: repeat(4, 1fr) auto; align-items: center;">
         <div class="kpi-card glass" onclick="openKpiDetail('balance')"><h3>Balance</h3><div class="kpi-val" id="kpi-balance">£0</div></div>
         <div class="kpi-card glass" onclick="openKpiDetail('income')"><h3>Income</h3><div class="kpi-val" id="kpi-income">£0</div></div>
         <div class="kpi-card glass" onclick="openKpiDetail('expenses')"><h3>Expense</h3><div class="kpi-val" id="kpi-expense">£0</div></div>
         <div class="kpi-card glass" onclick="openKpiDetail('savings')"><h3>Savings</h3><div class="kpi-val" id="kpi-savings">0%</div></div>
+        <div style="display: flex; align-items: center; gap: 10px; justify-self: end;">
+          <button type="button" id="sync-button" class="btn-primary" onclick="typeof manualSync === 'function' ? manualSync() : loadDashboardData(true)" title="Reload data from spreadsheet">
+            <i class="fas fa-sync-alt" id="sync-icon"></i> Sync from source
+          </button>
+          <span id="last-sync-time" style="font-size: 11px; color: var(--text-dim);"></span>
+        </div>
       </header>
 
       <section id="page-content">
         <div id="loader" class="loader-container" style="display: none;"><div class="spinner"></div><p>Loading data...</p></div>
+
+        <!-- No-data banner: shown when no transactions loaded -->
+        <div id="no-data-banner" class="glass" style="display: none; margin-bottom: 20px; padding: 20px; border-left: 4px solid var(--warning); background: rgba(255,170,0,0.1);">
+          <strong style="color: var(--warning);"><i class="fas fa-info-circle"></i> No data loaded</strong>
+          <p style="margin: 10px 0 0; color: var(--text-dim); font-size: 14px;">
+            1. Open your <b>Financial Dashboard</b> spreadsheet in Google Drive (in the browser).<br>
+            2. In the sheet menu, click <b>🚀 Financial Dashboard</b> → <b>Initialize System</b> (this creates the transaction sheet and sample data).<br>
+            3. Come back here and click <b>Sync from source</b> above.
+          </p>
+          <button type="button" class="btn-primary" style="margin-top: 12px;" onclick="typeof manualSync === 'function' ? manualSync() : loadDashboardData(true)"><i class="fas fa-sync-alt"></i> Sync from source</button>
+        </div>
+
+        <!-- Universal date selector + Refresh (Dashboard) -->
+        <div id="date-selector-bar" class="date-selector-bar glass" style="display: flex; align-items: center; gap: 16px; flex-wrap: wrap; padding: 12px 16px; margin-bottom: 20px;">
+          <span style="color: var(--text-dim); font-weight: 600;">Date range:</span>
+          <input type="date" id="start-date" class="filter-input" style="background: rgba(0,0,0,0.3); border: 1px solid var(--glass-border); color: var(--text); padding: 8px 12px; border-radius: 8px;">
+          <span style="color: var(--text-dim);">to</span>
+          <input type="date" id="end-date" class="filter-input" style="background: rgba(0,0,0,0.3); border: 1px solid var(--glass-border); color: var(--text); padding: 8px 12px; border-radius: 8px;">
+          <button type="button" class="btn-outline btn-small" onclick="applyDateFilter()"><i class="fas fa-filter"></i> Apply</button>
+          <button type="button" class="btn-outline btn-small" onclick="setQuickRange('month')">Month</button>
+          <button type="button" class="btn-outline btn-small" onclick="setQuickRange('quarter')">3 months</button>
+          <button type="button" class="btn-outline btn-small" onclick="setQuickRange('year')">Year</button>
+          <button type="button" class="btn-outline btn-small" onclick="setQuickRange('all')">All</button>
+          <button type="button" class="btn-outline btn-small" onclick="clearFilter()"><i class="fas fa-times"></i> Clear</button>
+        </div>
+
+        <div id="filtered-summary" class="glass" style="display: none; margin-bottom: 20px; padding: 15px;">
+          <strong>Filtered:</strong> <span id="filtered-count">0</span> transactions &nbsp; Balance: <span id="filtered-balance">£0.00</span> &nbsp; Income: <span id="filtered-income">£0.00</span> &nbsp; Expense: <span id="filtered-expense">£0.00</span>
+        </div>
 
         <!-- Dashboard -->
         <div id="dashboard-view" class="grid-container">
@@ -97,6 +133,26 @@
           </div>
           <div style="text-align: center; padding: 20px;">
             <button class="btn-primary" onclick="syncNetWorth()"><i class="fas fa-sync"></i> Sync Net Worth</button>
+          </div>
+        </div>
+
+        <!-- Labs: diagnostics, health check, logs -->
+        <div id="labs-view" style="display: none;">
+          <div class="glass" style="padding: 20px; margin-bottom: 20px;">
+            <h2><i class="fas fa-flask"></i> Labs – Diagnostics &amp; pipeline</h2>
+            <label style="display: flex; align-items: center; gap: 10px; margin: 15px 0;">
+              <input type="checkbox" id="labs-diagnostics-toggle"> Show diagnostics on load (connection + logs)
+            </label>
+            <div style="display: flex; flex-wrap: wrap; gap: 10px; margin-top: 15px;">
+              <button type="button" class="btn-primary" onclick="runHealthCheckFromLabs()"><i class="fas fa-heartbeat"></i> Health check</button>
+              <button type="button" class="btn-outline" onclick="runTestFromLabs()"><i class="fas fa-vial"></i> Run testGetDashboardData</button>
+              <button type="button" class="btn-outline" onclick="refreshLabsLogs()"><i class="fas fa-sync-alt"></i> Refresh logs</button>
+            </div>
+          </div>
+          <div id="labs-connection" class="glass" style="padding: 15px; margin-bottom: 15px; font-family: monospace; font-size: 13px;"></div>
+          <div class="glass" style="padding: 15px;">
+            <h3>Recent log entries (monitor failures)</h3>
+            <pre id="labs-log-entries" style="background: rgba(0,0,0,0.3); padding: 12px; border-radius: 8px; max-height: 300px; overflow-y: auto; font-size: 12px; white-space: pre-wrap;"></pre>
           </div>
         </div>
 

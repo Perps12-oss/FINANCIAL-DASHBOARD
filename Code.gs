@@ -12,7 +12,9 @@ function onOpen() {
   } catch (e) {}
   SpreadsheetApp.getUi()
     .createMenu('🚀 Financial Dashboard')
-    .addItem('Open Dashboard', 'showDashboard')
+    .addItem('Start menu (choose dashboard)', 'showStartMenu')
+    .addItem('Open Classic Dashboard', 'showDashboard')
+    .addItem('Open SACRED Dashboard', 'showSacredDashboard')
     .addItem('Initialize System', 'setupSystem')
     .addSeparator()
     .addItem('Help & Setup', 'showHelp')
@@ -32,12 +34,25 @@ function runTestGetDashboardData() {
   SpreadsheetApp.getUi().alert(result.success ? 'testGetDashboardData passed. Check View > Logs for details.' : 'testGetDashboardData failed: ' + (result.error || 'unknown'));
 }
 
-function doGet() {
-  return HtmlService.createTemplateFromFile('Index')
-    .evaluate()
-    .setTitle('SaaS Financial Dashboard')
-    .addMetaTag('viewport', 'width=device-width, initial-scale=1')
-    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+function doGet(e) {
+  var param = (e && e.parameter) ? e.parameter : {};
+  var view = (param.view || '').toLowerCase();
+  var output;
+  if (view === 'sacred') {
+    output = HtmlService.createHtmlOutputFromFile('Sacred')
+      .setTitle('SACRED Financial Dashboard')
+      .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+  } else if (view === 'classic') {
+    output = HtmlService.createTemplateFromFile('Index')
+      .evaluate()
+      .setTitle('Financial Dashboard')
+      .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+  } else {
+    output = HtmlService.createHtmlOutputFromFile('Start')
+      .setTitle('Financial Dashboard')
+      .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+  }
+  return output.addMetaTag('viewport', 'width=device-width, initial-scale=1');
 }
 
 function showDashboard() {
@@ -46,6 +61,22 @@ function showDashboard() {
     .setWidth(1400)
     .setHeight(900);
   SpreadsheetApp.getUi().showModalDialog(html, '💰 Financial Command Center');
+}
+
+function showStartMenu() {
+  const html = HtmlService.createHtmlOutputFromFile('Start')
+    .setWidth(500)
+    .setHeight(380)
+    .setTitle('Financial Dashboard');
+  SpreadsheetApp.getUi().showModalDialog(html, 'Choose dashboard');
+}
+
+function showSacredDashboard() {
+  const html = HtmlService.createHtmlOutputFromFile('Sacred')
+    .setWidth(1400)
+    .setHeight(900)
+    .setTitle('SACRED Financial Dashboard');
+  SpreadsheetApp.getUi().showModalDialog(html, 'SACRED Financial Dashboard - Enhanced Edition');
 }
 
 function include(filename) {

@@ -1,0 +1,28 @@
+---
+description: Google Apps Script + clasp project structure and deployment
+alwaysApply: true
+---
+
+# Apps Script Project (clasp)
+
+This repo is a **Google Apps Script** project managed locally with **clasp**. Follow these conventions.
+
+## File structure
+
+- **`.gs`** — Server-side code (Code.gs, Api.gs, etc.). Prefer `.gs` for all server-side logic.
+- **`.html`** — HtmlService templates and fragments (e.g. Index.html, Style.html, JavaScript.html).
+- **`appsscript.json`** — Manifest only. Do not add custom build or bundling config here.
+
+Keep the standard Apps Script layout; do not rename to `.js` for server code unless required by an explicit request.
+
+## Deployment
+
+- **Deployment path**: `clasp push` (and `clasp deploy` when publishing).
+- Do not introduce npm/webpack/vite/other build tooling unless the user explicitly asks for it.
+- Assume the project runs in the Apps Script runtime; no Node/browser bundling.
+
+## When editing
+
+- Add or change server logic in `.gs` files.
+- Add or change UI/templates in `.html` files.
+- Respect `.claspignore` so only intended files are pushed (e.g. `*.gs`, `*.html`, `appsscript.json`).

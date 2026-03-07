@@ -1,2105 +1,1206 @@
 <script>
-  // ============================================
-  // GLOBAL STATE MANAGEMENT
-  // ============================================
   const AppState = {
-    data: null,
-    calendar: null,
-    chartInstances: {},
-    modalChartInstance: null,
-    currentTheme: localStorage.getItem('appTheme') || 'dark',
-    filters: { category: null },
-    dateRange: { start: null, end: null },
-    pendingRequests: new Set(),
-    toastQueue: [],
-    update(key, value) {
-      this[key] = value;
-      window.dispatchEvent(new CustomEvent('appstate-change', { detail: { key, value } }));
+    route: 'dashboard',
+    range: '30d',
+    fromIso: '',
+    toIso: '',
+    theme: localStorage.getItem('classicTheme') || 'sacred',
+    bundle: null,
+    chartPack: null,
+    transactions: { items: [], total: 0, categories: [], page: 1, pageSize: 25, filters: { search: '', category: 'All', min: '', max: '' } },
+    budgets: [],
+    budgetChart: null,
+    goals: [],
+    insights: '',
+    settings: {},
+    sourceInfo: {},
+    diagnostics: null,
+    healthReport: null,
+    logs: [],
+    accounts: [],
+    calendar: {
+      view: 'month',
+      anchorDate: new Date().toISOString().slice(0, 10),
+      data: null,
+      activeDate: null,
+      activeDayData: null
     }
   };
 
-  function getFilteredTransactions() {
-    var txs = AppState.data && Array.isArray(AppState.data.transactions) ? AppState.data.transactions : [];
-    var range = AppState.dateRange;
-    if (!range || !range.start || !range.end) return txs;
-    var start = new Date(range.start);
-    var end = new Date(range.end);
-    end.setHours(23, 59, 59);
-    return txs.filter(function(t) {
-      var d = new Date(t.date);
-      return d >= start && d <= end;
-    });
-  }
+  const PageMeta = {
+    dashboard: ['Dashboard', 'Unified overview, KPI strip, and the high-value charts.'],
+    transactions: ['Transactions', 'Server-backed pagination and fast filtering.'],
+    analytics: ['Analytics', 'Playful chart pack adapted to the single-source backend.'],
+    budget: ['Budget', 'Budget actuals, editing, and smart suggestions.'],
+    goals: ['Goals', 'Track progress targets without leaving the dashboard.'],
+    calendar: ['Calendar', 'Month/week cards with server-backed notes and drill-down.'],
+    categories: ['Categories', 'Category leaderboard and share of spend.'],
+    merchants: ['Merchants', 'Merchant ranking and concentration analysis.'],
+    insights: ['Insights', 'Recurring signals, quick actions, and AI summaries.'],
+    forecast: ['Forecast', 'Projection view plus net-worth style account editing.'],
+    settings: ['Settings', 'Theme and source configuration for the rebuilt Classic app.'],
+    system: ['System', 'Health, diagnostics, and recent logs.'],
+    labs: ['Labs', 'Import, cache controls, and backend diagnostics.']
+  };
 
-  function getEffectiveKPIs() {
-    var full = AppState.data && Array.isArray(AppState.data.transactions) ? AppState.data.transactions : [];
-    var filtered = getFilteredTransactions();
-    var balance = full.reduce(function(s, t) { return s + t.amount; }, 0);
-    var income = filtered.filter(function(t) { return t.amount > 0; }).reduce(function(s, t) { return s + t.amount; }, 0);
-    var expense = Math.abs(filtered.filter(function(t) { return t.amount < 0; }).reduce(function(s, t) { return s + t.amount; }, 0));
-    var savingsRate = income > 0 ? ((income - expense) / income) * 100 : 0;
-    var serverKpis = AppState.data && AppState.data.kpis ? AppState.data.kpis : {};
-    return {
-      balance: balance.toFixed(2),
-      income: income.toFixed(2),
-      expense: expense.toFixed(2),
-      savingsRate: savingsRate.toFixed(1),
-      daysToPayday: serverKpis.daysToPayday != null ? serverKpis.daysToPayday : 0,
-      avgIncome: serverKpis.avgIncome || '0.00',
-      avgExpense: serverKpis.avgExpense || '0.00'
-    };
-  }
+  const ThemeOptions = [
+    { id: 'sacred', label: 'Sacred Blue', cls: 'theme-sacred', preview: 'theme-sacred-preview' },
+    { id: 'midnight', label: 'Midnight', cls: 'theme-midnight', preview: 'theme-midnight-preview' },
+    { id: 'emerald', label: 'Emerald', cls: 'theme-emerald', preview: 'theme-emerald-preview' },
+    { id: 'ember', label: 'Ember', cls: 'theme-ember', preview: 'theme-ember-preview' }
+  ];
 
-  function updateFilteredSummaryUI() {
-    var range = AppState.dateRange;
-    var summaryEl = document.getElementById('filtered-summary');
-    if (!summaryEl) return;
-    if (!range || !range.start || !range.end) {
-      summaryEl.style.display = 'none';
-      return;
-    }
-    var txs = getFilteredTransactions();
-    var income = txs.filter(function(t) { return t.amount > 0; }).reduce(function(s, t) { return s + t.amount; }, 0);
-    var expense = txs.filter(function(t) { return t.amount < 0; }).reduce(function(s, t) { return s + Math.abs(t.amount); }, 0);
-    var balance = income - expense;
-    document.getElementById('filtered-count').innerText = txs.length;
-    var balanceEl = document.getElementById('filtered-balance');
-    if (balanceEl) { balanceEl.innerText = '£' + balance.toFixed(2); balanceEl.style.color = balance >= 0 ? 'var(--success)' : 'var(--danger)'; }
-    var incomeEl = document.getElementById('filtered-income');
-    if (incomeEl) incomeEl.innerText = '£' + income.toFixed(2);
-    var expenseEl = document.getElementById('filtered-expense');
-    if (expenseEl) expenseEl.innerText = '£' + expense.toFixed(2);
-    summaryEl.style.display = 'block';
-  }
-
-  function refreshDateDrivenViews() {
-    if (!AppState.data) return;
-    updateKPIs(getEffectiveKPIs());
-    renderDashboardCharts();
-    if (document.getElementById('calendar')) initializeCalendar();
-    updateFilteredSummaryUI();
-  }
-
-  // ============================================
-  // ERROR BOUNDARY & SAFE EXECUTION
-  // ============================================
-  async function safeExecute(fn, fallback = null, errorMessage = 'Operation failed') {
-    try {
-      return await fn();
-    } catch (error) {
-      console.error(`${errorMessage}:`, error);
-      showToast(errorMessage, 'error');
-      return fallback;
-    }
-  }
-
-  // ============================================
-  // DEBOUNCE UTILITY
-  // ============================================
-  function debounce(func, wait) {
-    let timeout;
-    return function executedFunction(...args) {
-      const later = () => {
-        clearTimeout(timeout);
-        func(...args);
-      };
-      clearTimeout(timeout);
-      timeout = setTimeout(later, wait);
-    };
-  }
-
-  // ============================================
-  // INITIALIZATION (IMPROVED)
-  // ============================================
-  document.addEventListener('DOMContentLoaded', async function() {
-    try {
-      initializeTheme();
-      await initializeApp();
-      initializeEventListeners();
-      initializeServiceWorker();
-    } catch (error) {
-      showError('Failed to initialize application: ' + error.message);
-    }
+  document.addEventListener('DOMContentLoaded', async () => {
+    applyTheme(AppState.theme);
+    bindGlobalUI();
+    Router.init();
+    await DataLoader.bootstrap();
   });
 
-  function initializeTheme() {
-    var saved = localStorage.getItem('appTheme') || '';
-    var themeClass = saved.indexOf('theme-') === 0 ? saved : ('theme-' + (saved || 'dark'));
-    document.body.className = themeClass;
-    AppState.currentTheme = themeClass.replace(/^theme-/, '') || 'dark';
-  }
-
-  async function initializeApp() {
-    showLoader(true);
-    await loadDashboardData();
-    showLoader(false);
-  }
-
-  function initializeEventListeners() {
-    // Dropzone with proper drag & drop
-    const dropZone = document.getElementById('drop-zone');
-    if (dropZone) {
-      ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
-        dropZone.addEventListener(eventName, preventDefaults);
-      });
-      
-      dropZone.addEventListener('drop', handleDrop);
-      dropZone.addEventListener('click', () => document.getElementById('csv-file').click());
-    }
-
-    // File input with validation
-    const fileInput = document.getElementById('csv-file');
-    if (fileInput) {
-      fileInput.addEventListener('change', handleFileSelect);
-    }
-
-    // Window resize handler for charts
-    window.addEventListener('resize', debounce(handleResize, 250));
-    
-    // Keyboard shortcuts
-    window.addEventListener('keydown', handleKeyboardShortcuts);
-  }
-
-  function preventDefaults(e) {
-    e.preventDefault();
-    e.stopPropagation();
-  }
-
-  function handleResize() {
-    if (AppState.calendar) AppState.calendar.updateSize();
-    Object.values(AppState.chartInstances).forEach(chart => {
-      if (chart && typeof chart.resize === 'function') chart.resize();
+  function serverCall(functionName, ...args) {
+    return new Promise((resolve, reject) => {
+      if (typeof google === 'undefined' || !google.script || !google.script.run) {
+        reject(new Error('Dashboard must be opened from the Financial Dashboard web app link.'));
+        return;
+      }
+      const runner = google.script.run
+        .withSuccessHandler(resolve)
+        .withFailureHandler(err => reject(new Error(err && err.message ? err.message : String(err))));
+      runner[functionName](...args);
     });
   }
 
-  function handleKeyboardShortcuts(e) {
-    // Ctrl/Cmd + K to search
-    if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
-      e.preventDefault();
-      showQuickSearch();
-    }
-    // Escape to close modals
-    if (e.key === 'Escape') {
-      closeAllModals();
-    }
-  }
-
-  // ============================================
-  // TOAST NOTIFICATION SYSTEM (ENHANCED)
-  // ============================================
-  function showToast(message, type = 'info', duration = 4000) {
-    const container = document.getElementById('toast-container');
-    if (!container) return;
-
-    const id = `toast-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-    const icon = {
-      success: 'check-circle',
-      error: 'exclamation-circle',
-      warning: 'exclamation-triangle',
-      info: 'info-circle'
-    }[type] || 'info-circle';
-
-    const toast = document.createElement('div');
-    toast.id = id;
-    toast.className = `toast ${type}`;
-    toast.setAttribute('role', 'alert');
-    toast.innerHTML = `
-      <i class="fas fa-${icon}"></i>
-      <span>${message}</span>
-      <button class="toast-close" onclick="this.parentElement.remove()">×</button>
-    `;
-
-    container.appendChild(toast);
-    
-    // Trigger animation
-    setTimeout(() => toast.classList.add('show'), 10);
-    
-    // Auto remove
-    const timeoutId = setTimeout(() => {
-      toast.classList.remove('show');
-      setTimeout(() => toast.remove(), 300);
-    }, duration);
-
-    // Store timeout for cleanup
-    toast.dataset.timeoutId = timeoutId;
-    
-    // Pause timeout on hover
-    toast.addEventListener('mouseenter', () => clearTimeout(timeoutId));
-    toast.addEventListener('mouseleave', () => {
-      const newTimeout = setTimeout(() => {
-        toast.classList.remove('show');
-        setTimeout(() => toast.remove(), 300);
-      }, duration);
-      toast.dataset.timeoutId = newTimeout;
-    });
-  }
-
-  function showError(message) { showToast(message, 'error'); }
-  function showSuccess(message) { showToast(message, 'success'); }
-  function showWarning(message) { showToast(message, 'warning'); }
-
-  // ============================================
-  // LOADER MANAGEMENT
-  // ============================================
   function showLoader(show) {
-    const loader = document.getElementById('loader');
-    if (!loader) return;
-    
-    if (show) {
-      loader.style.display = 'flex';
-      loader.setAttribute('aria-label', 'Loading content');
+    const el = document.getElementById('loader');
+    if (!el) return;
+    el.classList.toggle('hidden', !show);
+  }
+
+  function showToast(message, type = 'info') {
+    const container = document.getElementById('toast-container');
+    const toast = document.createElement('div');
+    toast.className = `toast ${type}`;
+    toast.textContent = message;
+    container.appendChild(toast);
+    setTimeout(() => toast.remove(), 3500);
+  }
+
+  function formatCurrency(value) {
+    const amount = Number(value) || 0;
+    return new Intl.NumberFormat('en-GB', { style: 'currency', currency: 'GBP' }).format(amount);
+  }
+
+  function formatSigned(value) {
+    const amount = Number(value) || 0;
+    return `${amount >= 0 ? '+' : '-'}${formatCurrency(Math.abs(amount))}`;
+  }
+
+  function formatPct(value) {
+    const amount = Number(value) || 0;
+    return `${amount.toFixed(1)}%`;
+  }
+
+  function escapeHtml(value) {
+    return String(value == null ? '' : value)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  function debounce(fn, wait) {
+    let timeout;
+    return (...args) => {
+      clearTimeout(timeout);
+      timeout = setTimeout(() => fn(...args), wait);
+    };
+  }
+
+  function currentRangeOpts() {
+    return {
+      range: AppState.range,
+      fromIso: AppState.range === 'custom' ? AppState.fromIso || null : null,
+      toIso: AppState.range === 'custom' ? AppState.toIso || null : null
+    };
+  }
+
+  function setPageMeta(route) {
+    const meta = PageMeta[route] || PageMeta.dashboard;
+    var titleEl = document.getElementById('page-title');
+    var subtitleEl = document.getElementById('page-subtitle');
+    if (titleEl) titleEl.textContent = meta[0];
+    if (subtitleEl) subtitleEl.textContent = meta[1];
+  }
+
+  function applyTheme(themeId) {
+    const theme = ThemeOptions.find(item => item.id === themeId) || ThemeOptions[0];
+    document.body.className = theme.cls;
+    AppState.theme = theme.id;
+    localStorage.setItem('classicTheme', theme.id);
+    renderThemes();
+  }
+
+  function bindGlobalUI() {
+    var rangeSelect = document.getElementById('range-select');
+    if (rangeSelect) rangeSelect.addEventListener('change', handleRangeChange);
+    var applyRangeBtn = document.getElementById('apply-range-btn');
+    if (applyRangeBtn) applyRangeBtn.addEventListener('click', () => DataLoader.reloadRangeData(true));
+    var syncBtn = document.getElementById('sync-btn');
+    if (syncBtn) syncBtn.addEventListener('click', async () => {
+      try {
+        showLoader(true);
+        const result = await serverCall('syncFromSourceSheet');
+        showToast(result.status === 'ok' ? `Synced ${result.rowsSynced || 0} rows.` : (result.message || 'Sync failed'), result.status === 'ok' ? 'success' : 'error');
+        await DataLoader.reloadAll();
+      } catch (error) {
+        showToast(error.message, 'error');
+      } finally {
+        showLoader(false);
+      }
+    });
+    var exportBtn = document.getElementById('export-btn');
+    if (exportBtn) exportBtn.addEventListener('click', ExportModule.exportCsv);
+    var switchSacred = document.getElementById('switch-to-sacred');
+    if (switchSacred) {
+      switchSacred.addEventListener('click', function(e) {
+        e.preventDefault();
+        var base = window.location.origin + window.location.pathname;
+        window.top.location.href = base + (base.indexOf('?') === -1 ? '?' : '&') + 'view=sacred';
+      });
+    }
+    var commandBtn = document.getElementById('command-btn');
+    if (commandBtn) commandBtn.addEventListener('click', CommandPalette.open);
+    document.querySelectorAll('[data-route-jump]').forEach(button => {
+      button.addEventListener('click', () => Router.go(button.dataset.routeJump));
+    });
+    document.querySelectorAll('[data-close]').forEach(button => {
+      button.addEventListener('click', () => document.getElementById(button.dataset.close).classList.add('hidden'));
+    });
+    document.addEventListener('keydown', event => {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') {
+        event.preventDefault();
+        CommandPalette.open();
+      }
+      if (event.key === 'Escape') {
+        document.getElementById('calendar-modal').classList.add('hidden');
+        document.getElementById('command-palette').classList.add('hidden');
+      }
+    });
+    window.addEventListener('resize', debounce(() => {
+      if (typeof Plotly === 'undefined') return;
+      document.querySelectorAll('.chart-box').forEach(node => {
+        if (node) try { Plotly.Plots.resize(node); } catch (e) {}
+      });
+    }, 150));
+    TransactionsModule.bind();
+    BudgetModule.bind();
+    GoalsModule.bind();
+    CalendarModule.bind();
+    SettingsModule.bind();
+    SystemModule.bind();
+    LabsModule.bind();
+    ForecastModule.bind();
+    CommandPalette.bind();
+  }
+
+  function handleRangeChange() {
+    AppState.range = document.getElementById('range-select').value;
+    const isCustom = AppState.range === 'custom';
+    document.getElementById('custom-from').classList.toggle('hidden', !isCustom);
+    document.getElementById('custom-to').classList.toggle('hidden', !isCustom);
+    document.getElementById('apply-range-btn').classList.toggle('hidden', !isCustom);
+    if (!isCustom) {
+      DataLoader.reloadRangeData(true);
     } else {
-      loader.style.display = 'none';
-      loader.removeAttribute('aria-label');
+      AppState.fromIso = document.getElementById('custom-from').value || '';
+      AppState.toIso = document.getElementById('custom-to').value || '';
     }
   }
 
-  // ============================================
-  // DATA LOADING WITH CACHE & RETRY
-  // ============================================
-  async function loadDashboardData(forceRefresh = false) {
-    const cacheKey = 'dashboardData';
-    const cacheTime = 5 * 60 * 1000; // 5 minutes
+  const Router = {
+    init() {
+      document.querySelectorAll('.nav-link').forEach(button => {
+        button.addEventListener('click', () => this.go(button.dataset.route));
+      });
+      window.addEventListener('hashchange', () => this.render());
+      this.render();
+    },
+    go(route) {
+      window.location.hash = route;
+    },
+    render() {
+      const route = (window.location.hash || '#dashboard').replace('#', '');
+      AppState.route = PageMeta[route] ? route : 'dashboard';
+      document.querySelectorAll('.page').forEach(page => page.classList.toggle('active', page.dataset.page === AppState.route));
+      document.querySelectorAll('.nav-link').forEach(link => link.classList.toggle('active', link.dataset.route === AppState.route));
+      setPageMeta(AppState.route);
+      ChartRenderer.renderForRoute(AppState.route);
+    }
+  };
 
-    // Don't use cache if it was empty/error (so KPIs can refresh when data is now available)
-    if (!forceRefresh) {
-      const cached = sessionStorage.getItem(cacheKey);
-      if (cached) {
-        try {
-          const parsed = JSON.parse(cached);
-          const data = parsed.data;
-          const timestamp = parsed.timestamp || 0;
-          const isEmpty = !data || !Array.isArray(data.transactions) || data.transactions.length === 0 || data._error;
-          if (Date.now() - timestamp < cacheTime && !isEmpty) {
-            processDashboardData(data);
+  const DataLoader = {
+    async bootstrap() {
+      showLoader(true);
+      try {
+        await this.reloadAll();
+      } catch (error) {
+        showToast(error.message, 'error');
+      } finally {
+        showLoader(false);
+      }
+    },
+
+    async reloadAll() {
+      await Promise.all([
+        this.reloadRangeData(false),
+        GoalsModule.load(),
+        SettingsModule.load(),
+        SystemModule.load(),
+        ForecastModule.load()
+      ]);
+    },
+
+    async reloadRangeData(showLoading = false) {
+      if (showLoading) showLoader(true);
+      try {
+        if (AppState.range === 'custom') {
+          AppState.fromIso = document.getElementById('custom-from').value || AppState.fromIso;
+          AppState.toIso = document.getElementById('custom-to').value || AppState.toIso;
+          if (!AppState.fromIso || !AppState.toIso) {
+            showToast('Choose both custom dates first.', 'error');
             return;
           }
-        } catch (e) {}
-      }
-    }
-
-    // Load fresh data with retry (pass forceRefresh so server bypasses its cache when needed)
-    let retries = 3;
-    while (retries > 0) {
-      try {
-        const response = await new Promise((resolve, reject) => {
-          google.script.run
-            .withSuccessHandler(resolve)
-            .withFailureHandler(reject)
-            .getDashboardData(forceRefresh);
-        });
-        if (!response || typeof response !== 'object') throw new Error('Invalid response');
-        var data = response.data || {};
-        if (!Array.isArray(data.transactions)) data.transactions = [];
-        if (!data.kpis || typeof data.kpis !== 'object') data.kpis = { balance: '0.00', income: '0.00', expense: '0.00', savingsRate: '0', daysToPayday: 0, avgIncome: '0.00', avgExpense: '0.00' };
-        if (!forceRefresh && response.success) sessionStorage.setItem(cacheKey, JSON.stringify({ data: data, timestamp: Date.now() }));
-        processDashboardData(data);
-        showOrHideNoDataBanner();
-        if (data.transactions && data.transactions.length > 0) window._noDataToastShown = false;
-        if (!response.success && response.error) showToast(response.error, 'warning', 8000);
-        if (response.meta && response.meta.validation && (response.meta.validation.warnings || []).length) {
-          response.meta.validation.warnings.forEach(function(w) { showToast(w, 'info', 4000); });
         }
-        return;
-      } catch (error) {
-        retries--;
-        if (retries === 0) {
-          showError('Failed to load data. Open the spreadsheet once from Google Drive and run Initialize System from the menu, then refresh.');
-          processDashboardData({
-            transactions: [],
-            settings: {},
-            budgets: {},
-            nw: { assets: [], liabilities: [] },
-            goals: [],
-            kpis: { balance: '0.00', income: '0.00', expense: '0.00', savingsRate: '0', daysToPayday: 0, avgIncome: '0.00', avgExpense: '0.00' }
-          });
-          showOrHideNoDataBanner();
-        } else {
-          await new Promise(r => setTimeout(r, 1000));
-        }
+        const opts = currentRangeOpts();
+        const [bundle, chartPack, txData, budgets, insights, calendarData] = await Promise.all([
+          serverCall('getClassicDashboardBundle', opts),
+          serverCall('getClassicChartPack', opts),
+          serverCall('getClassicTransactions', { ...opts, offset: 0, limit: AppState.transactions.pageSize }),
+          serverCall('getBudgetsData', opts),
+          serverCall('getAiFinancialInsights'),
+          serverCall('getCalendarData', { view: AppState.calendar.view, anchorDate: AppState.calendar.anchorDate })
+        ]);
+        if (!bundle.success) throw new Error(bundle.error || 'Failed to load dashboard bundle');
+        AppState.bundle = bundle.data;
+        AppState.chartPack = chartPack.data || {};
+        AppState.transactions.page = 1;
+        AppState.transactions.items = txData.data.transactions || [];
+        AppState.transactions.total = txData.data.total || 0;
+        AppState.transactions.categories = txData.data.categories || [];
+        AppState.budgets = (budgets.data && budgets.data.budgets) || [];
+        AppState.budgetChart = (budgets.data && budgets.data.chart) || { categories: [], actual: [] };
+        AppState.insights = insights.data ? insights.data.text : '';
+        AppState.calendar.data = calendarData.data || null;
+        renderRangeBoundViews();
+      } finally {
+        if (showLoading) showLoader(false);
       }
     }
-    showLoader(false);
+  };
+
+  function renderRangeBoundViews() {
+    renderKpis();
+    renderBanner();
+    renderDashboardSummary();
+    TransactionsModule.render();
+    BudgetModule.render();
+    CalendarModule.render();
+    InsightsModule.render();
+    renderCategoryPage();
+    renderMerchantPage();
+    ChartRenderer.renderForRoute(AppState.route);
   }
 
-  function processDashboardData(data) {
-    if (!data) return;
-    AppState.update('data', data);
-    setDefaultDateRange();
-    updateKPIs(getEffectiveKPIs());
-    renderDashboardCharts();
-    initializeCalendar();
-    initializeNetWorth();
-    updateFilteredSummaryUI();
-    showOrHideNoDataBanner();
+  function renderKpis() {
+    const kpis = (AppState.bundle && AppState.bundle.kpis) || {};
+    document.getElementById('kpi-balance').textContent = formatCurrency(kpis.currentBalance);
+    document.getElementById('kpi-income').textContent = formatCurrency(kpis.totalIncome);
+    document.getElementById('kpi-expenses').textContent = formatCurrency(kpis.totalExpenses);
+    document.getElementById('kpi-savings').textContent = formatPct(kpis.savingsRate);
+    document.getElementById('kpi-burn').textContent = formatCurrency(kpis.burnRate);
+    document.getElementById('kpi-zero').textContent = kpis.projectedDaysToZero == null ? 'Stable' : `${kpis.projectedDaysToZero}d`;
+    document.getElementById('kpi-payday').textContent = kpis.daysUntilPayday == null ? '-' : `${kpis.daysUntilPayday}d`;
   }
 
-  function showOrHideNoDataBanner() {
-    var banner = document.getElementById('no-data-banner');
-    if (!banner) return;
-    var hasData = AppState.data && Array.isArray(AppState.data.transactions) && AppState.data.transactions.length > 0;
-    banner.style.display = hasData ? 'none' : 'block';
-  }
-
-  function setDefaultDateRange() {
-    var startEl = document.getElementById('start-date');
-    var endEl = document.getElementById('end-date');
-    if (!startEl || !endEl) return;
-    if (startEl.value && endEl.value) return;
-    var today = new Date();
-    var start = new Date(today.getFullYear(), today.getMonth(), 1);
-    startEl.value = start.getFullYear() + '-' + String(start.getMonth() + 1).padStart(2, '0') + '-' + String(start.getDate()).padStart(2, '0');
-    endEl.value = today.getFullYear() + '-' + String(today.getMonth() + 1).padStart(2, '0') + '-' + String(today.getDate()).padStart(2, '0');
-  }
-
-  function updateKPIs(kpis) {
-    var kpiElements = {
-      balance: 'kpi-balance',
-      income: 'kpi-income',
-      expense: 'kpi-expense',
-      savingsRate: 'kpi-savings'
-    };
-    if (!kpis) kpis = { balance: '0.00', income: '0.00', expense: '0.00', savingsRate: '0' };
-    Object.keys(kpiElements).forEach(function(key) {
-      var id = kpiElements[key];
-      var el = document.getElementById(id);
-      if (!el) return;
-      var val = kpis[key];
-      if (key === 'savingsRate') {
-        el.innerText = (val != null ? val : 0) + '%';
-        return;
-      }
-      var num = parseFloat(val);
-      if (isNaN(num)) num = 0;
-      el.innerText = '£' + num.toFixed(2);
-    });
-  }
-
-  // ============================================
-  // ENHANCED CALENDAR
-  // ============================================
-  function initializeCalendar() {
-    const calendarEl = document.getElementById('calendar');
-    if (!calendarEl || !AppState.data) return;
-
-    // Destroy existing calendar if any
-    if (AppState.calendar) {
-      AppState.calendar.destroy();
-    }
-
-    var rangeTx = getFilteredTransactions();
-    const events = rangeTx.map(t => ({
-      id: `tx-${t.date}-${t.description}-${Math.random()}`,
-      title: `${t.description} (${t.category})`,
-      start: t.date,
-      end: t.date,
-      allDay: true,
-      className: t.amount >= 0 ? 'fc-event-income' : 'fc-event-expense',
-      extendedProps: { ...t },
-      backgroundColor: t.amount >= 0 ? 'var(--success)' : 'var(--danger)',
-      borderColor: 'transparent'
-    }));
-
-    AppState.calendar = new FullCalendar.Calendar(calendarEl, {
-      initialView: 'dayGridMonth',
-      headerToolbar: {
-        left: 'prev,next today',
-        center: 'title',
-        right: 'dayGridMonth,timeGridWeek,listMonth'
-      },
-      events: events,
-      eventDisplay: 'block',
-      dayMaxEvents: 3,
-      moreLinkClick: 'day',
-      
-      dayCellDidMount: (info) => {
-        renderSparkline(info.date, info.el);
-      },
-      
-      dateClick: (info) => {
-        showDayTransactions(info.dateStr, info.jsEvent);
-      },
-      
-      eventClick: (info) => {
-        showTransactionDetails(info.event.extendedProps, info.jsEvent);
-      },
-      
-      eventDidMount: (info) => {
-        // Add tooltip
-        info.el.setAttribute('title', 
-          `${info.event.title}\nAmount: £${Math.abs(info.event.extendedProps.amount).toFixed(2)}`
-        );
-      },
-      
-      height: 'auto',
-      aspectRatio: 1.8,
-      
-      // Localization
-      locale: 'en',
-      firstDay: 1, // Monday
-      
-      // Loading indicator
-      loading: (isLoading) => {
-        showLoader(isLoading);
-      }
-    });
-
-    AppState.calendar.render();
-  }
-
-  function renderSparkline(date, cellEl) {
-    var rangeTx = getFilteredTransactions();
-    if (!rangeTx.length) return;
-    const dateStr = date.toISOString().split('T')[0];
-    const dayTxs = rangeTx.filter(t => t.date === dateStr);
-    if (dayTxs.length === 0) return;
-
-    const totals = dayTxs.reduce((acc, t) => {
-      if (t.amount > 0) acc.income += t.amount;
-      else acc.expense += Math.abs(t.amount);
-      return acc;
-    }, { income: 0, expense: 0 });
-
-    const maxValue = Math.max(totals.income, totals.expense, 1);
-    const wrap = document.createElement('div');
-    wrap.className = 'day-sparkline-wrap';
-    wrap.setAttribute('aria-label', `Income: £${totals.income.toFixed(2)}, Expense: £${totals.expense.toFixed(2)}`);
-
-    if (totals.income > 0) {
-      const bar = document.createElement('div');
-      bar.className = 'spark-bar spark-income';
-      bar.style.width = `${(totals.income / maxValue) * 100}%`;
-      wrap.appendChild(bar);
-    }
-
-    if (totals.expense > 0) {
-      const bar = document.createElement('div');
-      bar.className = 'spark-bar spark-expense';
-      bar.style.width = `${(totals.expense / maxValue) * 100}%`;
-      wrap.appendChild(bar);
-    }
-
-    const frame = cellEl.querySelector('.fc-daygrid-day-frame');
-    if (frame) frame.appendChild(wrap);
-  }
-
-  // ============================================
-  // TRANSACTION MODALS
-  // ============================================
-  function showDayTransactions(dateStr, jsEvent) {
-    if (!AppState.data) return;
-    var rangeTx = getFilteredTransactions();
-    const dayTxs = rangeTx.filter(t => t.date === dateStr).sort((a, b) => Math.abs(b.amount) - Math.abs(a.amount));
-
-    if (dayTxs.length === 0) return;
-
-    const modal = document.getElementById('tiny-modal');
-    const title = document.getElementById('tiny-modal-title');
-    const body = document.getElementById('tiny-modal-body');
-    
-    title.textContent = `Transactions: ${formatDate(dateStr, 'long')}`;
-    body.innerHTML = dayTxs.map(t => createTransactionRow(t)).join('');
-
-    positionModal(modal, jsEvent);
-    modal.style.display = 'block';
-  }
-
-  function showTransactionDetails(transaction, jsEvent) {
-    const modal = document.getElementById('tiny-modal');
-    const title = document.getElementById('tiny-modal-title');
-    const body = document.getElementById('tiny-modal-body');
-    
-    title.textContent = formatDate(transaction.date, 'long');
-    body.innerHTML = createTransactionDetails(transaction);
-
-    positionModal(modal, jsEvent);
-    modal.style.display = 'block';
-  }
-
-  function createTransactionRow(t) {
-    const isIncome = t.amount >= 0;
-    return `
-      <div class="tiny-tx-item" onclick="showTransactionDetails(${JSON.stringify(t).replace(/"/g, '&quot;')}, event)">
-        <div>
-          <div style="font-weight:500;">${escapeHtml(t.description)}</div>
-          <div style="color:var(--text-dim); font-size:11px;">${escapeHtml(t.category || 'Uncategorized')}</div>
-        </div>
-        <div style="font-weight:700; color:${isIncome ? 'var(--success)' : 'var(--danger)'}">
-          ${isIncome ? '+' : '-'}£${Math.abs(t.amount).toFixed(2)}
-        </div>
-      </div>
-    `;
-  }
-
-  function createTransactionDetails(t) {
-    return `
-      <div class="transaction-detail">
-        <div class="detail-row">
-          <span class="detail-label">Description:</span>
-          <span class="detail-value">${escapeHtml(t.description)}</span>
-        </div>
-        <div class="detail-row">
-          <span class="detail-label">Amount:</span>
-          <span class="detail-value" style="color:${t.amount >= 0 ? 'var(--success)' : 'var(--danger)'}">
-            ${t.amount >= 0 ? '+' : '-'}£${Math.abs(t.amount).toFixed(2)}
-          </span>
-        </div>
-        <div class="detail-row">
-          <span class="detail-label">Category:</span>
-          <span class="detail-value">${escapeHtml(t.category || 'Uncategorized')}</span>
-        </div>
-        <div class="detail-row">
-          <span class="detail-label">Date:</span>
-          <span class="detail-value">${formatDate(t.date, 'long')}</span>
-        </div>
-        <div class="detail-actions">
-          <button class="btn-outline btn-small" onclick="editTransaction('${t.date}', '${escapeHtml(t.description)}')">
-            <i class="fas fa-edit"></i> Edit
-          </button>
-          <button class="btn-outline btn-small" onclick="categorizeTransaction('${t.date}', '${escapeHtml(t.description)}')">
-            <i class="fas fa-tag"></i> Recategorize
-          </button>
-        </div>
-      </div>
-    `;
-  }
-
-  function positionModal(modal, jsEvent) {
-    const x = jsEvent.clientX;
-    const y = jsEvent.clientY;
-    
-    modal.style.display = 'block';
-    const rect = modal.getBoundingClientRect();
-    
-    let left = x;
-    let top = y;
-    
-    if (left + rect.width > window.innerWidth) {
-      left = window.innerWidth - rect.width - 20;
-    }
-    if (top + rect.height > window.innerHeight) {
-      top = window.innerHeight - rect.height - 20;
-    }
-    
-    modal.style.left = left + 'px';
-    modal.style.top = top + 'px';
-    modal.style.transform = 'none';
-  }
-
-  function closeTinyModal() {
-    document.getElementById('tiny-modal').style.display = 'none';
-  }
-
-  // ============================================
-  // KPI DETAIL MODAL (ENHANCED)
-  // ============================================
-  function openKpiDetail(type) {
-    console.log('Opening KPI detail:', type);
-    
-    const modal = document.getElementById('kpi-detail-modal');
-    const bodyEl = document.getElementById('kpi-detail-body');
-    const titleEl = document.getElementById('detail-title');
-    
-    if (!modal || !bodyEl || !titleEl) {
-      console.error('Modal elements not found');
+  function renderBanner() {
+    const banner = document.getElementById('validation-banner');
+    const meta = AppState.bundle && AppState.bundle.meta;
+    const warnings = [];
+    if (meta && meta.validation && Array.isArray(meta.validation.errors)) warnings.push(...meta.validation.errors);
+    if (meta && meta.validation && Array.isArray(meta.validation.warnings)) warnings.push(...meta.validation.warnings);
+    if (!warnings.length && meta && meta.totalRows) {
+      banner.classList.add('hidden');
+      banner.textContent = '';
       return;
     }
-    
-    if (!AppState.data || !AppState.data.transactions) {
-      showError('No data available');
-      return;
-    }
-    var rangeTx = getFilteredTransactions();
-    var balanceTx = AppState.data.transactions;
-    var rangeLabel = AppState.dateRange && AppState.dateRange.start && AppState.dateRange.end ? ' (selected range)' : '';
-
-    let content = '';
-    switch(type) {
-      case 'balance':
-        titleEl.textContent = 'Balance History';
-        content = generateBalanceView(balanceTx);
-        break;
-      case 'income':
-        titleEl.textContent = 'Income' + rangeLabel;
-        const incomeTxs = rangeTx.filter(t => t.amount > 0);
-        content = generateIncomeView(incomeTxs);
-        break;
-      case 'expenses':
-        titleEl.textContent = 'Expenses' + rangeLabel;
-        const expenseTxs = rangeTx.filter(t => t.amount < 0);
-        content = generateExpenseView(expenseTxs);
-        break;
-      case 'savings':
-        titleEl.textContent = 'Savings Analysis' + rangeLabel;
-        content = generateSavingsView(rangeTx);
-        break;
-      default:
-        titleEl.textContent = 'Details';
-        content = '<p>Select a valid KPI</p>';
-    }
-
-    bodyEl.innerHTML = content;
-    modal.style.display = 'block';
-    if (type === 'income' || type === 'expenses') {
-      setTimeout(function() {
-        var canvas = document.getElementById('modal-chart');
-        if (canvas) {
-          var data = type === 'income' ? rangeTx.filter(function(t) { return t.amount > 0; }) : rangeTx.filter(function(t) { return t.amount < 0; });
-          renderCategoryChart(data);
-        }
-      }, 100);
-    }
+    if (!meta || !meta.totalRows) warnings.push('No transactions were returned for the selected source.');
+    banner.innerHTML = warnings.map(item => `<div>${escapeHtml(item)}</div>`).join('');
+    banner.classList.remove('hidden');
   }
 
-  function generateBalanceView(fullTransactions) {
-    var txs = fullTransactions || (AppState.data && AppState.data.transactions) || [];
-    if (!txs.length) return '<p>No data</p>';
-    var sorted = txs.slice().sort(function(a, b) { return new Date(a.date) - new Date(b.date); });
-    var running = 0;
-    const balancePoints = sorted.map(t => {
-      running += t.amount;
-      return { date: t.date, balance: running };
-    });
-    const totalIncome = txs.filter(t => t.amount > 0).reduce((s, t) => s + t.amount, 0);
-    const totalExpense = txs.filter(t => t.amount < 0).reduce((s, t) => s + Math.abs(t.amount), 0);
-    const currentBalance = running;
-    
-    const highest = Math.max(...balancePoints.map(p => p.balance));
-    const lowest = Math.min(...balancePoints.map(p => p.balance));
-    
-    return `
-      <div class="kpi-detail-stats">
-        <div class="stat-card glass">
-          <span class="stat-label">Current Balance</span>
-          <span class="stat-value" style="color: ${currentBalance >= 0 ? 'var(--success)' : 'var(--danger)'}">
-            £${currentBalance.toFixed(2)}
-          </span>
-        </div>
-        <div class="stat-card glass">
-          <span class="stat-label">Highest Balance</span>
-          <span class="stat-value">£${highest.toFixed(2)}</span>
-        </div>
-        <div class="stat-card glass">
-          <span class="stat-label">Lowest Balance</span>
-          <span class="stat-value">£${lowest.toFixed(2)}</span>
-        </div>
-        <div class="stat-card glass">
-          <span class="stat-label">Lifetime Income</span>
-          <span class="stat-value" style="color: var(--success)">+£${totalIncome.toFixed(2)}</span>
-        </div>
-        <div class="stat-card glass">
-          <span class="stat-label">Lifetime Expense</span>
-          <span class="stat-value" style="color: var(--danger)">-£${totalExpense.toFixed(2)}</span>
-        </div>
-      </div>
-      <div class="chart-wrapper-modal">
-        <canvas id="modal-chart"></canvas>
-      </div>
-      <h3 style="margin: 20px 0 10px;">Balance History</h3>
-      <div class="detail-list">
-        ${balancePoints.slice(-20).map(p => `
-          <div class="detail-row">
-            <span class="detail-date">${formatDate(p.date)}</span>
-            <span class="detail-desc">Balance</span>
-            <span class="detail-amount" style="color: ${p.balance >= 0 ? 'var(--success)' : 'var(--danger)'}">
-              £${p.balance.toFixed(2)}
-            </span>
-          </div>
-        `).join('')}
-      </div>
-    `;
-  }
-
-  function generateIncomeView(incomes) {
-    const total = incomes.reduce((s, t) => s + t.amount, 0);
-    const avg = incomes.length > 0 ? total / incomes.length : 0;
-    
-    // Group by category
-    const categories = {};
-    incomes.forEach(t => {
-      const cat = t.category || 'Uncategorized';
-      categories[cat] = (categories[cat] || 0) + t.amount;
-    });
-
-    return `
-      <div class="kpi-detail-stats">
-        <div class="stat-card glass">
-          <span class="stat-label">Total Income</span>
-          <span class="stat-value" style="color: var(--success)">£${total.toFixed(2)}</span>
-        </div>
-        <div class="stat-card glass">
-          <span class="stat-label">Transactions</span>
-          <span class="stat-value">${incomes.length}</span>
-        </div>
-        <div class="stat-card glass">
-          <span class="stat-label">Average</span>
-          <span class="stat-value">£${avg.toFixed(2)}</span>
-        </div>
-        <div class="stat-card glass">
-          <span class="stat-label">Categories</span>
-          <span class="stat-value">${Object.keys(categories).length}</span>
-        </div>
-      </div>
-      
-      <div class="chart-wrapper-modal">
-        <canvas id="modal-chart"></canvas>
-      </div>
-      
-      <h3 style="margin: 20px 0 10px;">Income Sources</h3>
-      <div class="detail-list">
-        ${incomes.slice(0, 15).map(t => `
-          <div class="detail-row">
-            <span class="detail-date">${formatDate(t.date)}</span>
-            <span class="detail-desc">${escapeHtml(t.description)}</span>
-            <span class="detail-cat" style="color: var(--text-dim); font-size: 11px;">${escapeHtml(t.category || '')}</span>
-            <span class="detail-amount" style="color: var(--success)">+£${t.amount.toFixed(2)}</span>
-          </div>
-        `).join('')}
-        ${incomes.length > 15 ? `<div style="text-align: center; padding: 10px; color: var(--text-dim);">... and ${incomes.length - 15} more</div>` : ''}
-      </div>
-    `;
-  }
-
-  function generateExpenseView(expenses) {
-    const total = expenses.reduce((s, t) => s + Math.abs(t.amount), 0);
-    const avg = expenses.length > 0 ? total / expenses.length : 0;
-    
-    // Group by category
-    const categories = {};
-    expenses.forEach(t => {
-      const cat = t.category || 'Uncategorized';
-      categories[cat] = (categories[cat] || 0) + Math.abs(t.amount);
-    });
-
-    return `
-      <div class="kpi-detail-stats">
-        <div class="stat-card glass">
-          <span class="stat-label">Total Expenses</span>
-          <span class="stat-value" style="color: var(--danger)">£${total.toFixed(2)}</span>
-        </div>
-        <div class="stat-card glass">
-          <span class="stat-label">Transactions</span>
-          <span class="stat-value">${expenses.length}</span>
-        </div>
-        <div class="stat-card glass">
-          <span class="stat-label">Average</span>
-          <span class="stat-value">£${avg.toFixed(2)}</span>
-        </div>
-        <div class="stat-card glass">
-          <span class="stat-label">Categories</span>
-          <span class="stat-value">${Object.keys(categories).length}</span>
-        </div>
-      </div>
-      
-      <div class="chart-wrapper-modal">
-        <canvas id="modal-chart"></canvas>
-      </div>
-      
-      <h3 style="margin: 20px 0 10px;">Top Expenses</h3>
-      <div class="detail-list">
-        ${expenses.sort((a,b) => Math.abs(b.amount) - Math.abs(a.amount)).slice(0, 15).map(t => `
-          <div class="detail-row">
-            <span class="detail-date">${formatDate(t.date)}</span>
-            <span class="detail-desc">${escapeHtml(t.description)}</span>
-            <span class="detail-cat" style="color: var(--text-dim); font-size: 11px;">${escapeHtml(t.category || '')}</span>
-            <span class="detail-amount" style="color: var(--danger)">-£${Math.abs(t.amount).toFixed(2)}</span>
-          </div>
-        `).join('')}
-      </div>
-    `;
-  }
-
-  function generateSavingsView(transactions) {
-    const income = transactions.filter(t => t.amount > 0).reduce((s, t) => s + t.amount, 0);
-    const expense = transactions.filter(t => t.amount < 0).reduce((s, t) => s + Math.abs(t.amount), 0);
-    const savings = income - expense;
-    const rate = income > 0 ? (savings / income) * 100 : 0;
-    
-    // Calculate daily average
-    const daysInMonth = new Date(new Date().getFullYear(), new Date().getMonth() + 1, 0).getDate();
-    const dailyAvg = expense / daysInMonth;
-
-    return `
-      <div class="savings-dashboard">
-        <div style="display: flex; gap: 30px; align-items: center; justify-content: center; flex-wrap: wrap;">
-          <div class="savings-ring" style="position: relative; width: 200px; height: 200px;">
-            <svg viewBox="0 0 120 120" style="transform: rotate(-90deg);">
-              <circle cx="60" cy="60" r="54" fill="none" stroke="rgba(255,255,255,0.1)" stroke-width="12"/>
-              <circle cx="60" cy="60" r="54" fill="none" 
-                      stroke="${rate >= 15 ? 'var(--success)' : rate > 0 ? 'var(--warning)' : 'var(--danger)'}" 
-                      stroke-width="12" 
-                      stroke-dasharray="${2 * Math.PI * 54}" 
-                      stroke-dashoffset="${2 * Math.PI * 54 * (1 - Math.min(Math.abs(rate), 100) / 100)}"
-                      style="transition: stroke-dashoffset 0.5s;"/>
-            </svg>
-            <div style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); text-align: center;">
-              <div style="font-size: 32px; font-weight: 800; color: ${rate >= 15 ? 'var(--success)' : rate > 0 ? 'var(--warning)' : 'var(--danger)'}">
-                ${rate.toFixed(1)}%
-              </div>
-              <div style="font-size: 11px; color: var(--text-dim);">Savings Rate</div>
-            </div>
-          </div>
-          
-          <div class="savings-stats" style="min-width: 250px;">
-            <div class="stat-row">
-              <span>💰 Income</span>
-              <span style="color: var(--success); font-weight: 600;">+£${income.toFixed(2)}</span>
-            </div>
-            <div class="stat-row">
-              <span>💸 Expenses</span>
-              <span style="color: var(--danger); font-weight: 600;">-£${expense.toFixed(2)}</span>
-            </div>
-            <div class="stat-row" style="border-top: 1px solid var(--glass-border); padding-top: 10px; margin-top: 5px;">
-              <span>📊 Net Savings</span>
-              <span style="color: ${savings >= 0 ? 'var(--success)' : 'var(--danger)'}; font-weight: 700;">
-                ${savings >= 0 ? '+' : '-'}£${Math.abs(savings).toFixed(2)}
-              </span>
-            </div>
-            <div class="stat-row">
-              <span>📅 Daily Avg Spend</span>
-              <span>£${dailyAvg.toFixed(2)}</span>
-            </div>
-          </div>
-        </div>
-        
-        <div class="savings-tips glass" style="margin-top: 20px; padding: 15px;">
-          <h4 style="color: var(--primary); margin-bottom: 10px;"><i class="fas fa-lightbulb"></i> Insights</h4>
-          <ul style="list-style: none; padding-left: 0;">
-            ${generateSavingsInsights(rate, savings, income, expense)}
-          </ul>
-        </div>
-        
-        <!-- Optional: Add a mini trend chart here if desired, but we omit for brevity -->
-      </div>
-    `;
-  }
-
-  function generateSavingsInsights(rate, savings, income, expense) {
-    const insights = [];
-    
-    if (rate >= 20) {
-      insights.push('✅ Excellent savings rate! Consider investing surplus.');
-    } else if (rate >= 10) {
-      insights.push('👍 Good savings rate. You\'re on track!');
-    } else if (rate > 0) {
-      insights.push('⚠️ Savings rate could be improved. Try to reduce discretionary spending.');
-    } else if (rate === 0) {
-      insights.push('⚠️ Breaking even. Look for ways to increase income or reduce expenses.');
-    } else {
-      insights.push('🔴 Spending exceeds income. Review your expenses immediately.');
-    }
-    
-    if (expense > income * 0.5) {
-      insights.push('💡 Your expense-to-income ratio is high. Consider fixed cost reduction.');
-    }
-    
-    if (income === 0) {
-      insights.push('⚠️ No income recorded this month. Add income transactions.');
-    }
-    
-    if (insights.length === 0) {
-      insights.push('📊 Keep tracking your finances for personalized insights.');
-    }
-    
-    return insights.map(i => `<li style="margin-bottom: 8px;">${i}</li>`).join('');
-  }
-
-  // Fix renderCategoryChart to work with the modal (already defined, but we enhance it)
-  function renderCategoryChart(data) {
-    const canvas = document.getElementById('modal-chart');
-    if (!canvas) return;
-    
-    // Destroy existing chart
-    if (AppState.modalChartInstance) {
-      AppState.modalChartInstance.destroy();
-    }
-    
-    const categoryMap = {};
-    data.forEach(t => {
-      const cat = t.category || 'Uncategorized';
-      categoryMap[cat] = (categoryMap[cat] || 0) + Math.abs(t.amount);
-    });
-    
-    const colors = [
-      '#00d2ff', '#ff4d4d', '#00ff88', '#ffaa00',
-      '#9b59b6', '#3498db', '#e74c3c', '#2ecc71',
-      '#f39c12', '#1abc9c', '#e67e22', '#95a5a6'
+  function renderDashboardSummary() {
+    const bundle = AppState.bundle || { lists: {}, health: {}, meta: {}, kpis: {} };
+    const health = bundle.health || {};
+    document.getElementById('health-grade').textContent = health.grade || 'No data';
+    document.getElementById('health-message').textContent = health.message || 'Add more data to improve the signal quality.';
+    document.getElementById('health-total-rows').textContent = `${bundle.meta.totalRows || 0} rows`;
+    document.getElementById('health-range').textContent = bundle.meta.range || AppState.range;
+    const signalRows = [
+      { title: 'Net cash flow', value: formatSigned(bundle.kpis.netCashFlow), tone: bundle.kpis.netCashFlow >= 0 ? 'text-income' : 'text-expense' },
+      { title: 'Top category', value: bundle.lists.topCategories && bundle.lists.topCategories[0] ? `${bundle.lists.topCategories[0].name} · ${formatCurrency(bundle.lists.topCategories[0].amount)}` : 'No category data', tone: '' },
+      { title: 'Top merchant', value: bundle.lists.topMerchants && bundle.lists.topMerchants[0] ? `${bundle.lists.topMerchants[0].name} · ${formatCurrency(bundle.lists.topMerchants[0].amount)}` : 'No merchant data', tone: '' }
     ];
-    
-    const ctx = canvas.getContext('2d');
-    AppState.modalChartInstance = new Chart(ctx, {
-      type: 'doughnut',
-      data: {
-        labels: Object.keys(categoryMap),
-        datasets: [{
-          data: Object.values(categoryMap),
-          backgroundColor: colors.slice(0, Object.keys(categoryMap).length),
-          borderWidth: 0,
-          hoverOffset: 15
-        }]
-      },
-      options: {
-        responsive: true,
-        maintainAspectRatio: false,
-        plugins: {
-          legend: {
-            position: 'bottom',
-            labels: {
-              color: 'rgba(255,255,255,0.8)',
-              font: { size: 11 }
-            }
-          },
-          tooltip: {
-            callbacks: {
-              label: (context) => {
-                const value = context.raw;
-                const total = context.dataset.data.reduce((a, b) => a + b, 0);
-                const percentage = ((value / total) * 100).toFixed(1);
-                return `£${value.toFixed(2)} (${percentage}%)`;
-              }
-            }
-          }
-        },
-        cutout: '65%',
-        animation: {
-          animateRotate: true,
-          animateScale: true
-        }
-      }
-    });
-  }
-
-  // ============================================
-  // CLIENT-SIDE CHART DATA (driven by date range)
-  // ============================================
-  function buildSankeyFromTransactions(txs) {
-    var MIN = 50;
-    var incomeMap = {};
-    txs.filter(function(t) { return t.amount > 0; }).forEach(function(t) {
-      incomeMap[t.description] = (incomeMap[t.description] || 0) + t.amount;
-    });
-    var expenseMap = {};
-    txs.filter(function(t) { return t.amount < 0; }).forEach(function(t) {
-      expenseMap[t.category] = (expenseMap[t.category] || 0) + Math.abs(t.amount);
-    });
-    var incomeLabels = Object.keys(incomeMap).filter(function(k) { return incomeMap[k] > MIN; });
-    var expenseLabels = Object.keys(expenseMap);
-    var labels = incomeLabels.concat(['💰 Total Income']).concat(expenseLabels);
-    var sources = [], targets = [], values = [];
-    var totalIdx = incomeLabels.length;
-    incomeLabels.forEach(function(_, i) {
-      sources.push(i);
-      targets.push(totalIdx);
-      values.push(incomeMap[incomeLabels[i]]);
-    });
-    expenseLabels.forEach(function(_, i) {
-      sources.push(totalIdx);
-      targets.push(totalIdx + 1 + i);
-      values.push(expenseMap[expenseLabels[i]]);
-    });
-    return { labels: labels, sources: sources, targets: targets, values: values };
-  }
-
-  function build3DMatrixFromTransactions(txs) {
-    var categorySpend = {};
-    txs.filter(function(t) { return t.amount < 0; }).forEach(function(t) {
-      categorySpend[t.category] = (categorySpend[t.category] || 0) + Math.abs(t.amount);
-    });
-    var categories = Object.keys(categorySpend).sort(function(a, b) { return categorySpend[b] - categorySpend[a]; }).slice(0, 8);
-    var months = [], monthKeys = [];
-    for (var i = 5; i >= 0; i--) {
-      var d = new Date();
-      d.setMonth(d.getMonth() - i);
-      months.push(d.toLocaleString('default', { month: 'short', year: '2-digit' }));
-      monthKeys.push(d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0'));
-    }
-    var z = months.map(function() { return categories.map(function() { return 0; }); });
-    txs.forEach(function(t) {
-      if (t.amount >= 0) return;
-      var key = t.date.substring(0, 7);
-      var monthIdx = monthKeys.indexOf(key);
-      var catIdx = categories.indexOf(t.category);
-      if (monthIdx !== -1 && catIdx !== -1) z[monthIdx][catIdx] += Math.abs(t.amount);
-    });
-    return { x: categories, y: months, z: z };
-  }
-
-  // ============================================
-  // CHART RENDERING (PLOTLY) – uses getFilteredTransactions()
-  // ============================================
-  function renderDashboardCharts() {
-    renderSankeyChart();
-    render3DMatrix();
-    renderRunningBalance();
-  }
-
-  function renderSankeyChart() {
-    var chartId = 'chart-sankey';
-    var txs = getFilteredTransactions();
-    var data = buildSankeyFromTransactions(txs);
-    if (!data.labels.length) {
-      document.getElementById(chartId).innerHTML = '<p style="color:var(--text-dim);padding:40px;text-align:center;">No data for selected range.</p>';
-      return;
-    }
-    safeExecute(function() {
-      var totalIdx = data.labels.indexOf('💰 Total Income');
-      var trace = {
-        type: 'sankey',
-        orientation: 'h',
-        node: {
-          pad: 15,
-          thickness: 20,
-          label: data.labels,
-          color: data.labels.map(function(l, i) {
-            if (i === totalIdx) return '#00d2ff';
-            if (i < totalIdx) return 'rgba(0, 255, 136, 0.8)';
-            return 'rgba(255, 77, 77, 0.8)';
-          }),
-          line: { color: 'rgba(255,255,255,0.2)', width: 0.5 },
-          hoverinfo: 'all'
-        },
-        link: { source: data.sources, target: data.targets, value: data.values, color: 'rgba(255,255,255,0.1)' }
-      };
-      var layout = { font: { size: 12, color: '#fff' }, paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)', margin: { l: 20, r: 20, t: 20, b: 20 }, hoverlabel: { bgcolor: 'rgba(0,0,0,0.8)', font: { color: '#fff' } } };
-      Plotly.newPlot(chartId, [trace], layout, { responsive: true, displayModeBar: false, showSendToCloud: false });
-      AppState.chartInstances[chartId] = true;
-    }, null, 'Failed to render Sankey chart');
-  }
-
-  function render3DMatrix() {
-    var chartId = 'chart-3d';
-    var txs = getFilteredTransactions();
-    var data = build3DMatrixFromTransactions(txs);
-    if (!data.x.length) {
-      document.getElementById(chartId).innerHTML = '<p style="color:var(--text-dim);padding:40px;text-align:center;">No data for selected range.</p>';
-      return;
-    }
-    safeExecute(function() {
-
-      const trace = {
-        x: data.x,
-        y: data.y,
-        z: data.z,
-        type: 'surface',
-        colorscale: [
-          [0, '#020024'],
-          [0.3, '#090979'],
-          [0.6, '#00d2ff'],
-          [1, '#00ff88']
-        ],
-        contours: {
-          z: {
-            show: true,
-            usecolormap: true,
-            highlightcolor: "#42f5e3",
-            project: { z: true }
-          }
-        },
-        hovertemplate: '<b>Category:</b> %{x}<br><b>Month:</b> %{y}<br><b>Spend:</b> £%{z:.2f}<extra></extra>'
-      };
-
-      const layout = {
-        autosize: true,
-        paper_bgcolor: 'rgba(0,0,0,0)',
-        margin: { l: 0, r: 0, b: 0, t: 0 },
-        scene: {
-          camera: {
-            eye: { x: 1.8, y: 1.8, z: 1.5 }
-          },
-          xaxis: { 
-            tickfont: { color: '#ccc', size: 10 },
-            gridcolor: 'rgba(255,255,255,0.1)'
-          },
-          yaxis: { 
-            tickfont: { color: '#ccc', size: 10 },
-            gridcolor: 'rgba(255,255,255,0.1)'
-          },
-          zaxis: { 
-            tickfont: { color: '#ccc', size: 10 },
-            gridcolor: 'rgba(255,255,255,0.1)'
-          }
-        }
-      };
-
-      Plotly.newPlot(chartId, [trace], layout, { responsive: true, displayModeBar: false });
-      AppState.chartInstances[chartId] = true;
-    }, null, 'Failed to render 3D chart');
-  }
-
-  function renderRunningBalance() {
-    var chartId = 'chart-running-balance';
-    var container = document.getElementById(chartId);
-    if (!container) return;
-    if (!AppState.data || !Array.isArray(AppState.data.transactions)) {
-      container.innerHTML = '<p style="color:var(--text-dim);padding:40px;text-align:center;">No transaction data. Add data to the sheet or run Initialize System.</p>';
-      return;
-    }
-    var txs = getFilteredTransactions();
-    txs = txs.length ? txs.slice().sort(function(a, b) { return new Date(a.date) - new Date(b.date); }) : [];
-    var running = 0;
-    const balanceData = txs.map(function(t) {
-      running += t.amount;
-      return { date: t.date, balance: running };
-    });
-    if (balanceData.length === 0) {
-      container.innerHTML = '<p style="color:var(--text-dim);padding:40px;text-align:center;">No transaction data yet.</p>';
-      return;
-    }
-    const trace = {
-      x: balanceData.map(function(d) { return d.date; }),
-      y: balanceData.map(function(d) { return d.balance; }),
-      type: 'scatter',
-      mode: 'lines',
-      line: { color: '#00d2ff', width: 3, shape: 'spline' },
-      fill: 'tozeroy',
-      fillcolor: 'rgba(0, 210, 255, 0.1)',
-      hovertemplate: 'Date: %{x}<br>Balance: £%{y:.2f}<extra></extra>'
-    };
-
-    const layout = {
-      paper_bgcolor: 'rgba(0,0,0,0)',
-      plot_bgcolor: 'rgba(0,0,0,0)',
-      font: { color: '#fff' },
-      xaxis: { 
-        gridcolor: 'rgba(255,255,255,0.05)',
-        tickfont: { color: '#ccc' }
-      },
-      yaxis: { 
-        gridcolor: 'rgba(255,255,255,0.05)',
-        zerolinecolor: 'rgba(255,255,255,0.1)',
-        tickfont: { color: '#ccc' },
-        tickprefix: '£'
-      },
-      margin: { l: 50, r: 20, t: 20, b: 40 },
-      hoverlabel: { bgcolor: 'rgba(0,0,0,0.8)' }
-    };
-
-    Plotly.newPlot(chartId, [trace], layout, { 
-      responsive: true,
-      displayModeBar: false
-    });
-  }
-
-  // ============================================
-  // BUDGET MANAGEMENT
-  // ============================================
-  async function loadSmartSuggestions() {
-    showLoader(true);
-    
-    await safeExecute(async () => {
-      const budgets = await new Promise((resolve, reject) => {
-        google.script.run
-          .withSuccessHandler(resolve)
-          .withFailureHandler(reject)
-          .getSmartBudgets();
-      });
-
-      renderBudgetCards(budgets);
-      showLoader(false);
-    }, null, 'Failed to load budget suggestions');
-  }
-
-  function renderBudgetCards(budgets) {
-    const container = document.getElementById('budget-list');
-    if (!container) return;
-
-    if (!budgets?.length) {
-      container.innerHTML = '<p class="no-data">No budget data available</p>';
-      return;
-    }
-
-    container.innerHTML = budgets.map(b => {
-      const percent = b.currentMonthSpend > 0 ? 
-        (b.currentMonthSpend / b.suggestedLimit) * 100 : 0;
-      const isOver = percent > 100;
-
-      return `
-        <div class="budget-card glass ${isOver ? 'alert-border' : ''}">
-          <div class="budget-header">
-            <span class="budget-category">${escapeHtml(b.category)}</span>
-            <span class="budget-amount">
-              £${b.currentMonthSpend.toFixed(0)} / 
-              <input type="number" 
-                     value="${b.suggestedLimit}" 
-                     class="budget-input" 
-                     data-category="${escapeHtml(b.category)}"
-                     min="0"
-                     step="10">
-            </span>
-          </div>
-          <div class="progress-container">
-            <div class="progress-bar" 
-                 style="width: ${Math.min(percent, 100)}%; 
-                        background: ${isOver ? 'var(--danger)' : 'linear-gradient(90deg, var(--success), var(--primary))'};">
-            </div>
-          </div>
-          <div class="budget-footer">
-            <span class="budget-percent">${percent.toFixed(1)}% used</span>
-            <span class="budget-remaining ${isOver ? 'over' : ''}">
-              ${isOver ? 'Over by' : 'Remaining'}: 
-              £${Math.abs(b.suggestedLimit - b.currentMonthSpend).toFixed(2)}
-            </span>
-          </div>
-        </div>
-      `;
-    }).join('');
-  }
-
-  async function saveAllBudgets() {
-    const budgetMap = {};
-    document.querySelectorAll('.budget-input').forEach(input => {
-      const category = input.dataset.category;
-      const value = parseFloat(input.value) || 0;
-      if (category && value > 0) {
-        budgetMap[category] = value;
-      }
-    });
-
-    await safeExecute(async () => {
-      await new Promise((resolve, reject) => {
-        google.script.run
-          .withSuccessHandler(resolve)
-          .withFailureHandler(reject)
-          .saveFinalBudgets(budgetMap);
-      });
-      
-      showSuccess('Budgets saved successfully!');
-    }, null, 'Failed to save budgets');
-  }
-
-  // ============================================
-  // FORECAST
-  // ============================================
-  function runForecast() {
-    const adjustments = {
-      incomeMod: parseFloat(document.getElementById('income-slider')?.value || 0),
-      expenseMod: parseFloat(document.getElementById('expense-slider')?.value || 0)
-    };
-
-    showLoader(true);
-    
-    safeExecute(async () => {
-      const projection = await new Promise((resolve, reject) => {
-        google.script.run
-          .withSuccessHandler(resolve)
-          .withFailureHandler(reject)
-          .getForecastData(adjustments);
-      });
-
-      renderForecastChart(projection);
-      showLoader(false);
-    }, null, 'Failed to generate forecast');
-  }
-
-  function renderForecastChart(projection) {
-    if (!projection?.length) return;
-
-    const colors = projection.map(p => 
-      parseFloat(p.balance) >= 0 ? 'var(--success)' : 'var(--danger)'
-    );
-
-    const trace = {
-      x: projection.map(p => p.month),
-      y: projection.map(p => p.balance),
-      type: 'scatter',
-      mode: 'lines+markers',
-      line: { 
-        shape: 'spline', 
-        color: '#00ff88', 
-        width: 3 
-      },
-      marker: { 
-        size: 10, 
-        color: colors,
-        line: { color: '#fff', width: 2 }
-      },
-      fill: 'tozeroy',
-      fillcolor: 'rgba(0, 255, 136, 0.1)',
-      hovertemplate: 'Month: %{x}<br>Balance: £%{y:.2f}<extra></extra>'
-    };
-
-    const layout = {
-      title: { 
-        text: '12-Month Financial Projection', 
-        font: { color: '#fff', size: 16 } 
-      },
-      paper_bgcolor: 'rgba(0,0,0,0)',
-      plot_bgcolor: 'rgba(0,0,0,0)',
-      xaxis: { 
-        gridcolor: 'rgba(255,255,255,0.1)', 
-        tickfont: { color: '#ccc' },
-        tickangle: -45
-      },
-      yaxis: { 
-        title: 'Balance (£)', 
-        gridcolor: 'rgba(255,255,255,0.1)', 
-        tickfont: { color: '#ccc' },
-        tickprefix: '£'
-      },
-      margin: { l: 60, r: 30, b: 60, t: 60 },
-      hoverlabel: { bgcolor: 'rgba(0,0,0,0.8)' }
-    };
-
-    Plotly.newPlot('chart-forecast', [trace], layout, { 
-      responsive: true,
-      displayModeBar: false
-    });
-  }
-
-  // ============================================
-  // NET WORTH
-  // ============================================
-  function initializeNetWorth() {
-    if (!AppState.data?.nw) return;
-
-    const { assets = [], liabilities = [] } = AppState.data.nw;
-    
-    document.getElementById('asset-list').innerHTML = '';
-    document.getElementById('liab-list').innerHTML = '';
-
-    assets.forEach(a => addAssetRow('assets', a.name, a.value));
-    liabilities.forEach(l => addAssetRow('liabilities', l.name, l.value));
-
-    calculateNetWorthTotal();
-  }
-
-  function addAssetRow(type, name = '', value = 0) {
-    const container = document.getElementById(type === 'assets' ? 'asset-list' : 'liab-list');
-    if (!container) return;
-
-    const rowId = `row-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-    const row = document.createElement('div');
-    row.className = 'nw-row';
-    row.id = rowId;
-    row.innerHTML = `
-      <input type="text" class="nw-name" placeholder="Name" value="${escapeHtml(name)}">
-      <input type="number" class="nw-value" placeholder="Value" value="${value}" step="100" min="0">
-      <button class="nw-delete" onclick="removeAssetRow('${rowId}', '${type}')">
-        <i class="fas fa-times"></i>
-      </button>
-    `;
-
-    // Add change listeners
-    row.querySelectorAll('input').forEach(input => {
-      input.addEventListener('input', debounce(calculateNetWorthTotal, 300));
-    });
-
-    container.appendChild(row);
-    calculateNetWorthTotal();
-  }
-
-  function removeAssetRow(rowId, type) {
-    const row = document.getElementById(rowId);
-    if (row) {
-      row.remove();
-      calculateNetWorthTotal();
-      showToast('Item removed', 'info');
-    }
-  }
-
-  function calculateNetWorthTotal() {
-    let totalAssets = parseFloat(AppState.data?.kpis?.balance || 0);
-    let totalLiabilities = 0;
-
-    document.querySelectorAll('#asset-list .nw-value').forEach(input => {
-      totalAssets += parseFloat(input.value) || 0;
-    });
-
-    document.querySelectorAll('#liab-list .nw-value').forEach(input => {
-      totalLiabilities += parseFloat(input.value) || 0;
-    });
-
-    const total = totalAssets - totalLiabilities;
-    const element = document.getElementById('nw-total');
-    
-    if (element) {
-      element.textContent = `£${total.toLocaleString(undefined, {
-        minimumFractionDigits: 2,
-        maximumFractionDigits: 2
-      })}`;
-      element.style.color = total >= 0 ? 'var(--success)' : 'var(--danger)';
-    }
-
-    return total;
-  }
-
-  async function syncNetWorth() {
-    const assets = [];
-    const liabilities = [];
-
-    document.querySelectorAll('#asset-list .nw-row').forEach(row => {
-      const name = row.querySelector('.nw-name')?.value;
-      const value = parseFloat(row.querySelector('.nw-value')?.value) || 0;
-      if (name && value > 0) {
-        assets.push({ name, value });
-      }
-    });
-
-    document.querySelectorAll('#liab-list .nw-row').forEach(row => {
-      const name = row.querySelector('.nw-name')?.value;
-      const value = parseFloat(row.querySelector('.nw-value')?.value) || 0;
-      if (name && value > 0) {
-        liabilities.push({ name, value });
-      }
-    });
-
-    await safeExecute(async () => {
-      await new Promise((resolve, reject) => {
-        google.script.run
-          .withSuccessHandler(resolve)
-          .withFailureHandler(reject)
-          .saveNetWorth({ assets, liabilities });
-      });
-      
-      showSuccess('Net worth updated successfully!');
-    }, null, 'Failed to save net worth');
-  }
-
-  // ============================================
-  // SETTINGS
-  // ============================================
-  function toggleExternalInput() {
-    const type = document.getElementById('source-type')?.value;
-    const container = document.getElementById('external-id-container');
-    if (container) {
-      container.style.display = type === 'external' ? 'block' : 'none';
-    }
-  }
-
-  async function verifyConnection() {
-    const id = document.getElementById('external-sheet-id')?.value;
-    if (!id) {
-      showWarning('Please enter a Sheet ID');
-      return;
-    }
-
-    showLoader(true);
-    
-    await safeExecute(async () => {
-      const result = await new Promise((resolve, reject) => {
-        google.script.run
-          .withSuccessHandler(resolve)
-          .withFailureHandler(reject)
-          .testExternalConnection(id);
-      });
-
-      if (result.success) {
-        showSuccess(`Connected to: ${result.name}`);
-      } else {
-        showError(result.message);
-      }
-    }, null, 'Connection test failed');
-
-    showLoader(false);
-  }
-
-  async function saveAllSettings() {
-    const sourceType = document.getElementById('source-type')?.value;
-    const externalId = document.getElementById('external-sheet-id')?.value;
-    const apiKey = document.getElementById('openai-key')?.value;
-
-    showLoader(true);
-
-    // Save data source
-    const sourceSaved = await safeExecute(async () => {
-      await new Promise((resolve, reject) => {
-        google.script.run
-          .withSuccessHandler(resolve)
-          .withFailureHandler(reject)
-          .updateDataSource(sourceType, externalId);
-      });
-      return true;
-    }, false, 'Failed to save data source');
-
-    // Save API key if provided
-    if (apiKey && sourceSaved) {
-      await safeExecute(async () => {
-        await new Promise((resolve, reject) => {
-          google.script.run
-            .withSuccessHandler(resolve)
-            .withFailureHandler(reject)
-            .setUserProp('OPENAI_API_KEY', apiKey);
-        });
-      }, null, 'Failed to save API key');
-    }
-
-    showLoader(false);
-    
-    if (sourceSaved) {
-      showSuccess('Settings saved! Refreshing data...');
-      setTimeout(() => loadDashboardData(true), 1500);
-    }
-  }
-
-  // ============================================
-  // IMPORT WIZARD
-  // ============================================
-  function handleDrop(e) {
-    preventDefaults(e);
-    const file = e.dataTransfer?.files[0];
-    if (file && file.type === 'text/csv') {
-      handleFileSelect({ target: { files: [file] } });
-    } else {
-      showError('Please drop a CSV file');
-    }
-  }
-
-  function handleFileSelect(event) {
-    const file = event.target.files?.[0];
-    if (!file) return;
-
-    if (file.type !== 'text/csv' && !file.name.endsWith('.csv')) {
-      showError('Please select a CSV file');
-      return;
-    }
-
-    const reader = new FileReader();
-    reader.onload = function(e) {
-      processCSV(e.target.result);
-    };
-    reader.onerror = function() {
-      showError('Failed to read file');
-    };
-    reader.readAsText(file);
-  }
-
-  var _importCSVData = null;
-
-  function processCSV(csvText) {
-    const lines = csvText.split('\n').filter(line => line.trim());
-    if (lines.length < 2) {
-      showError('CSV must have headers and at least one data row');
-      return;
-    }
-
-    const headers = lines[0].split(',').map(h => h.trim());
-    const data = lines.slice(1).map(line => 
-      line.split(',').map(cell => cell.trim())
-    );
-
-    _importCSVData = { headers: headers, rows: data };
-    showToast(`Loaded ${data.length} rows`, 'success');
-    
-    document.getElementById('import-step-1').style.display = 'none';
-    document.getElementById('import-step-2').style.display = 'block';
-    
-    generateMappingUI(headers);
-  }
-
-  function generateMappingUI(headers) {
-    const mappingArea = document.getElementById('mapping-area');
-    const requiredFields = ['Date', 'Description', 'Amount', 'Category'];
-
-    mappingArea.innerHTML = requiredFields.map(field => `
-      <div class="mapping-row">
-        <label>${field}:</label>
-        <select class="map-select" data-field="${field.toLowerCase()}">
-          <option value="">-- Select Column --</option>
-          ${headers.map((h, i) => `<option value="${i}">${h}</option>`).join('')}
-        </select>
+    document.getElementById('smart-signals').innerHTML = signalRows.map(row => `
+      <div class="signal-card">
+        <strong>${escapeHtml(row.title)}</strong>
+        <div class="${row.tone || ''}">${escapeHtml(row.value)}</div>
       </div>
     `).join('');
+    renderRecentList();
+    renderRecurringList();
   }
 
-  async function executeImport() {
-    const mapping = {};
-    document.querySelectorAll('.map-select').forEach(select => {
-      mapping[select.dataset.field] = select.value;
-    });
+  function renderRecentList() {
+    const list = (AppState.bundle && AppState.bundle.lists && AppState.bundle.lists.recentTransactions) || [];
+    const target = document.getElementById('recent-transactions');
+    target.innerHTML = list.slice(0, 8).map(tx => `
+      <div class="list-item">
+        <div>
+          <strong>${escapeHtml(tx.description || tx.name)}</strong>
+          <div class="muted">${escapeHtml(tx.date)} · ${escapeHtml(tx.category)}</div>
+        </div>
+        <div class="${tx.type === 'income' ? 'text-income' : 'text-expense'}">${formatSigned(tx.amount)}</div>
+      </div>
+    `).join('') || '<div class="signal-card">No recent transactions.</div>';
+  }
 
-    const requiredFields = ['date', 'description', 'amount', 'category'];
-    const missingFields = requiredFields.filter(f => !mapping[f] || mapping[f] === '');
+  function renderRecurringList() {
+    const list = (AppState.bundle && AppState.bundle.lists && AppState.bundle.lists.recurringCandidates) || [];
+    const target = document.getElementById('recurring-candidates');
+    target.innerHTML = list.slice(0, 8).map(item => `
+      <div class="list-item">
+        <div>
+          <strong>${escapeHtml(item.description || item.name || 'Recurring pattern')}</strong>
+          <div class="muted">${escapeHtml(item.category || 'Recurring')}</div>
+        </div>
+        <div>${formatCurrency(item.avgAmount || item.amount || 0)}</div>
+      </div>
+    `).join('') || '<div class="signal-card">No recurring candidates found in this range.</div>';
+  }
 
-    if (missingFields.length > 0) {
-      showError(`Please map all required fields: ${missingFields.join(', ')}`);
-      return;
+  function renderCategoryPage() {
+    const list = (AppState.bundle && AppState.bundle.lists && AppState.bundle.lists.topCategories) || [];
+    document.getElementById('category-leaderboard').innerHTML = list.map((item, index) => `
+      <div class="leaderboard-item">
+        <div>
+          <strong>${index + 1}. ${escapeHtml(item.name)}</strong>
+          <div class="muted">${formatCurrency(item.amount)}</div>
+        </div>
+        <div>${formatPct(((item.amount || 0) / Math.max(1, AppState.bundle.kpis.totalExpenses || 1)) * 100)}</div>
+      </div>
+    `).join('') || '<div class="signal-card">No category spend for this period.</div>';
+  }
+
+  function renderMerchantPage() {
+    const list = (AppState.bundle && AppState.bundle.lists && AppState.bundle.lists.topMerchants) || [];
+    document.getElementById('merchant-leaderboard').innerHTML = list.map((item, index) => `
+      <div class="leaderboard-item">
+        <div>
+          <strong>${index + 1}. ${escapeHtml(item.name)}</strong>
+          <div class="muted">${item.transactions || 0} transactions</div>
+        </div>
+        <div>${formatCurrency(item.amount)}</div>
+      </div>
+    `).join('') || '<div class="signal-card">No merchant data for this period.</div>';
+  }
+
+  const ChartRenderer = {
+    renderForRoute(route) {
+      if (!AppState.chartPack || !AppState.bundle) return;
+      if (route === 'dashboard') this.renderDashboard();
+      if (route === 'analytics') this.renderAnalytics();
+      if (route === 'categories') this.renderCategories();
+      if (route === 'merchants') this.renderMerchants();
+      if (route === 'budget') BudgetModule.renderChart();
+      if (route === 'forecast') ForecastModule.renderChart();
+    },
+
+    baseLayout(title) {
+      return {
+        title: title || '',
+        paper_bgcolor: 'rgba(0,0,0,0)',
+        plot_bgcolor: 'rgba(0,0,0,0)',
+        font: { color: '#d9e5ff' },
+        margin: { l: 48, r: 18, t: 22, b: 42 }
+      };
+    },
+
+    renderDashboard() {
+      const pack = AppState.chartPack || {};
+      const run = pack.runningBalance || [];
+      const donut = pack.categoryDonut || [];
+      const incExp = pack.incomeVsExpense || [];
+      const monthly = pack.monthlyNet || [];
+      this.react('chart-running-balance', [{
+        x: run.map(row => row.date),
+        y: run.map(row => row.balance),
+        type: 'scatter',
+        mode: 'lines',
+        fill: 'tozeroy',
+        line: { color: '#79a8ff', width: 3 }
+      }], this.baseLayout(''));
+
+      this.react('chart-category-donut', [{
+        labels: donut.map(row => row.category),
+        values: donut.map(row => row.amount),
+        type: 'pie',
+        hole: 0.58,
+        marker: { colors: ['#79a8ff', '#4dd2ff', '#36d399', '#fbbf24', '#fb7185', '#c084fc', '#f472b6', '#818cf8'] }
+      }], this.baseLayout(''));
+
+      this.react('chart-income-expense', [
+        { x: incExp.map(row => row.month), y: incExp.map(row => row.income), type: 'scatter', mode: 'lines+markers', name: 'Income', line: { color: '#36d399', width: 3 } },
+        { x: incExp.map(row => row.month), y: incExp.map(row => row.expenses), type: 'scatter', mode: 'lines+markers', name: 'Expenses', line: { color: '#fb7185', width: 3 } }
+      ], this.baseLayout(''));
+
+      this.react('chart-monthly-net', [{
+        x: monthly.map(row => row.month),
+        y: monthly.map(row => row.net),
+        type: 'bar',
+        marker: { color: monthly.map(row => row.net >= 0 ? '#36d399' : '#fb7185') }
+      }], this.baseLayout(''));
+    },
+
+    renderAnalytics() {
+      const pack = AppState.chartPack || {};
+      const scatter = pack.scatter || [];
+      const hist = pack.histogram || [];
+      const wday = pack.weekdayHeatmap || {};
+      const catMonth = pack.categoryMonthHeatmap || {};
+      const waterfall = pack.monthlyWaterfall || [];
+      const surf = pack.surface3D || {};
+      const forecast = pack.forecast || {};
+      const trends = pack.categoryTrends || {};
+      const adv = pack.advancedTrend || [];
+      const sankey = pack.sankey || {};
+      this.react('chart-scatter', [{
+        x: scatter.map(row => row.date),
+        y: scatter.map(row => row.amount),
+        mode: 'markers',
+        type: 'scatter',
+        marker: { color: scatter.map(row => row.amount >= 0 ? '#36d399' : '#fb7185'), size: 9, opacity: 0.8 }
+      }], this.baseLayout(''));
+
+      this.react('chart-histogram', [{
+        x: hist,
+        type: 'histogram',
+        marker: { color: '#79a8ff' }
+      }], this.baseLayout(''));
+
+      this.react('chart-weekday-heatmap', [{
+        x: wday.x || [],
+        y: wday.y || [],
+        z: wday.z || [],
+        type: 'heatmap',
+        colorscale: 'Blues'
+      }], this.baseLayout(''));
+
+      this.react('chart-category-heatmap', [{
+        x: catMonth.x || [],
+        y: catMonth.y || [],
+        z: catMonth.z || [],
+        type: 'heatmap',
+        colorscale: 'YlOrRd'
+      }], this.baseLayout(''));
+
+      this.react('chart-waterfall', [{
+        x: waterfall.map(row => row.month),
+        y: waterfall.map(row => row.net),
+        type: 'waterfall',
+        connector: { line: { color: '#4dd2ff' } },
+        increasing: { marker: { color: '#36d399' } },
+        decreasing: { marker: { color: '#fb7185' } }
+      }], this.baseLayout(''));
+
+      this.react('chart-surface-3d', [{
+        x: surf.x || [],
+        y: surf.y || [],
+        z: surf.z || [],
+        type: 'surface',
+        colorscale: 'Viridis'
+      }], { ...this.baseLayout(''), scene: { bgcolor: 'rgba(0,0,0,0)' } });
+
+      this.react('chart-forecast-main', [
+        { x: forecast.labels || [], y: forecast.balance || [], type: 'scatter', mode: 'lines+markers', name: 'Balance', line: { color: '#79a8ff', width: 3 } },
+        { x: forecast.labels || [], y: forecast.netFlow || [], type: 'bar', name: 'Net flow', marker: { color: '#36d399' } }
+      ], this.baseLayout(''));
+
+      this.react('chart-category-trends', (trends.series || []).map((series) => ({
+        x: trends.months || [],
+        y: series.values || [],
+        type: 'scatter',
+        mode: 'lines+markers',
+        name: series.category,
+        line: { width: 2 }
+      })), this.baseLayout(''));
+
+      this.react('chart-advanced-trend', [
+        { x: adv.map(row => row.month), y: adv.map(row => row.totalSpending), type: 'scatter', mode: 'lines', name: 'Spending', line: { color: '#fb7185', width: 3 } },
+        { x: adv.map(row => row.month), y: adv.map(row => row.totalIncome), type: 'scatter', mode: 'lines', name: 'Income', line: { color: '#36d399', width: 3 } }
+      ], this.baseLayout(''));
+
+      this.react('chart-sankey', [{
+        type: 'sankey',
+        node: {
+          label: sankey.labels || [],
+          pad: 20,
+          thickness: 16,
+          color: '#79a8ff'
+        },
+        link: {
+          source: sankey.sources || [],
+          target: sankey.targets || [],
+          value: sankey.values || [],
+          color: sankey.colors || []
+        }
+      }], this.baseLayout(''));
+    },
+
+    renderCategories() {
+      const list = (AppState.bundle && AppState.bundle.lists && AppState.bundle.lists.topCategories) || [];
+      this.react('category-page-chart', [{
+        x: list.map(item => item.name),
+        y: list.map(item => item.amount),
+        type: 'bar',
+        marker: { color: '#79a8ff' }
+      }], this.baseLayout(''));
+    },
+
+    renderMerchants() {
+      const list = (AppState.bundle && AppState.bundle.lists && AppState.bundle.lists.topMerchants) || [];
+      const amounts = list.map(item => item.amount).reverse();
+      const names = list.map(item => item.name).reverse();
+      this.react('merchant-chart', [{
+        x: amounts,
+        y: names,
+        type: 'bar',
+        orientation: 'h',
+        marker: { color: '#4dd2ff' }
+      }], this.baseLayout(''));
+    },
+
+    react(id, data, layout) {
+      const node = document.getElementById(id);
+      if (!node || typeof Plotly === 'undefined') return;
+      try {
+        Plotly.react(node, data, layout, { displayModeBar: false, responsive: true });
+      } catch (err) {
+        console.warn('Chart render failed:', id, err);
+      }
     }
+  };
 
-    if (!_importCSVData || !_importCSVData.rows || _importCSVData.rows.length === 0) {
-      showError('No import data. Please select a CSV file again.');
-      return;
+  const TransactionsModule = {
+    bind() {
+      document.getElementById('tx-filter-btn').addEventListener('click', () => this.reload(1));
+      document.getElementById('tx-prev').addEventListener('click', () => this.reload(AppState.transactions.page - 1));
+      document.getElementById('tx-next').addEventListener('click', () => this.reload(AppState.transactions.page + 1));
+      document.getElementById('tx-search').addEventListener('input', debounce(() => this.reload(1), 250));
+    },
+
+    async reload(page = 1) {
+      AppState.transactions.filters = {
+        search: document.getElementById('tx-search').value.trim(),
+        category: document.getElementById('tx-category').value,
+        min: document.getElementById('tx-min').value,
+        max: document.getElementById('tx-max').value
+      };
+      AppState.transactions.page = Math.max(1, page);
+      const opts = {
+        ...currentRangeOpts(),
+        ...AppState.transactions.filters,
+        offset: (AppState.transactions.page - 1) * AppState.transactions.pageSize,
+        limit: AppState.transactions.pageSize
+      };
+      const result = await serverCall('getClassicTransactions', opts);
+      AppState.transactions.items = result.data.transactions || [];
+      AppState.transactions.total = result.data.total || 0;
+      AppState.transactions.categories = result.data.categories || [];
+      this.render();
+    },
+
+    render() {
+      const body = document.getElementById('transactions-body');
+      body.innerHTML = AppState.transactions.items.map(tx => `
+        <tr>
+          <td>${escapeHtml(tx.dateFormatted || tx.date)}</td>
+          <td>${escapeHtml(tx.description || tx.name)}</td>
+          <td>${escapeHtml(tx.category)}</td>
+          <td>${escapeHtml(tx.type)}</td>
+          <td class="${tx.type === 'income' ? 'text-income' : 'text-expense'}">${formatSigned(tx.amount)}</td>
+        </tr>
+      `).join('') || '<tr><td colspan="5">No transactions for the current filters.</td></tr>';
+      const indicator = document.getElementById('tx-page-indicator');
+      const pages = Math.max(1, Math.ceil(AppState.transactions.total / AppState.transactions.pageSize));
+      indicator.textContent = `Page ${AppState.transactions.page} of ${pages}`;
+      document.getElementById('transactions-summary').textContent = `${AppState.transactions.total} matching transactions`;
+      document.getElementById('tx-prev').disabled = AppState.transactions.page <= 1;
+      document.getElementById('tx-next').disabled = AppState.transactions.page >= pages;
+      const currentCategory = AppState.transactions.filters.category || 'All';
+      document.getElementById('tx-category').innerHTML = ['All'].concat(AppState.transactions.categories).map(category => `
+        <option value="${escapeHtml(category)}" ${category === currentCategory ? 'selected' : ''}>${escapeHtml(category === 'All' ? 'All categories' : category)}</option>
+      `).join('');
     }
+  };
 
-    const dateIdx = parseInt(mapping.date, 10);
-    const descIdx = parseInt(mapping.description, 10);
-    const amountIdx = parseInt(mapping.amount, 10);
-    const categoryIdx = mapping.category !== '' ? parseInt(mapping.category, 10) : -1;
+  const BudgetModule = {
+    bind() {
+      document.getElementById('budget-suggestions-btn').addEventListener('click', () => this.applySuggestions());
+      document.getElementById('budget-save-btn').addEventListener('click', () => this.save());
+    },
 
-    const dataArray = _importCSVData.rows.map(row => {
-      const dateVal = dateIdx >= 0 ? (row[dateIdx] || '').trim() : '';
-      const descVal = descIdx >= 0 ? (row[descIdx] || '').trim() : '';
-      const amtVal = amountIdx >= 0 ? parseFloat(row[amountIdx]) || 0 : 0;
-      const catVal = categoryIdx >= 0 ? (row[categoryIdx] || 'Uncategorized').trim() : 'Uncategorized';
-      return { date: dateVal, description: descVal, amount: amtVal, category: catVal };
-    }).filter(item => item.date && item.description);
-
-    showLoader(true);
-
-    await safeExecute(async () => {
-      const result = await new Promise((resolve, reject) => {
-        google.script.run
-          .withSuccessHandler(resolve)
-          .withFailureHandler(reject)
-          .processImportData(dataArray);
+    render() {
+      const list = document.getElementById('budget-list');
+      const actualByCategory = {};
+      (AppState.budgetChart.categories || []).forEach((category, index) => {
+        actualByCategory[category] = AppState.budgetChart.actual[index] || 0;
       });
+      list.innerHTML = AppState.budgets.map((budget, index) => {
+        const actual = actualByCategory[budget.category] || 0;
+        const amount = Number(budget.amount) || 0;
+        const pct = amount > 0 ? Math.min(100, (actual / amount) * 100) : 0;
+        return `
+          <div class="budget-card" data-budget-index="${index}">
+            <div class="budget-top">
+              <div>
+                <strong>${escapeHtml(budget.category)}</strong>
+                <div class="muted">${escapeHtml(budget.period || 'monthly')}</div>
+              </div>
+              <input class="control-input budget-input" type="number" value="${amount}">
+            </div>
+            <div class="progress"><div style="width:${pct}%"></div></div>
+            <div class="muted">${formatCurrency(actual)} spent of ${formatCurrency(amount)}</div>
+          </div>
+        `;
+      }).join('') || '<div class="signal-card">No budgets saved yet.</div>';
+      list.querySelectorAll('.budget-input').forEach((input, index) => {
+        input.addEventListener('change', event => {
+          AppState.budgets[index].amount = Number(event.target.value) || 0;
+          this.renderChart();
+        });
+      });
+      this.renderChart();
+    },
 
-      if (result && result.success) {
-        showSuccess(`Import completed: ${result.count || 0} transactions added.`);
-        closeImportWizard();
-        _importCSVData = null;
-        await loadDashboardData(true);
+    renderChart() {
+      const budgets = AppState.budgets || [];
+      const actualByCategory = {};
+      (AppState.budgetChart.categories || []).forEach((category, index) => {
+        actualByCategory[category] = AppState.budgetChart.actual[index] || 0;
+      });
+      const node = document.getElementById('budget-chart');
+      if (!node) return;
+      Plotly.react(node, [
+        { x: budgets.map(item => item.category), y: budgets.map(item => Number(item.amount) || 0), type: 'bar', name: 'Budget', marker: { color: '#79a8ff' } },
+        { x: budgets.map(item => item.category), y: budgets.map(item => actualByCategory[item.category] || 0), type: 'bar', name: 'Actual', marker: { color: '#fb7185' } }
+      ], ChartRenderer.baseLayout(''), { displayModeBar: false, responsive: true });
+    },
+
+    async applySuggestions() {
+      const result = await serverCall('getSmartBudgetSuggestions');
+      const suggestions = result.data || [];
+      suggestions.forEach(suggestion => {
+        const existing = AppState.budgets.find(item => item.category === suggestion.category);
+        if (existing && !existing.amount) existing.amount = suggestion.suggestedMonthly;
+        if (!existing) AppState.budgets.push({ category: suggestion.category, amount: suggestion.suggestedMonthly, period: 'monthly' });
+      });
+      this.render();
+      showToast('Applied smart budget suggestions.', 'success');
+    },
+
+    async save() {
+      const payload = {};
+      AppState.budgets.forEach(item => {
+        payload[item.category] = Number(item.amount) || 0;
+      });
+      const result = await serverCall('saveFinalBudgets', payload);
+      showToast(result.status === 'success' ? 'Budgets saved.' : (result.message || 'Budget save failed'), result.status === 'success' ? 'success' : 'error');
+      await DataLoader.reloadRangeData();
+    }
+  };
+
+  const GoalsModule = {
+    bind() {
+      document.getElementById('goal-save-btn').addEventListener('click', async () => {
+        const name = document.getElementById('goal-name').value.trim();
+        const target = document.getElementById('goal-target').value;
+        const current = document.getElementById('goal-current').value;
+        if (!name) return showToast('Goal name is required.', 'error');
+        const result = await serverCall('updateGoal', { name, target, current });
+        if (!result.success) return showToast(result.error || 'Failed to save goal.', 'error');
+        document.getElementById('goal-name').value = '';
+        document.getElementById('goal-target').value = '';
+        document.getElementById('goal-current').value = '';
+        await this.load();
+        showToast('Goal saved.', 'success');
+      });
+    },
+
+    async load() {
+      const result = await serverCall('getGoalsData');
+      AppState.goals = (result.data && result.data.goals) || [];
+      this.render();
+    },
+
+    render() {
+      const target = document.getElementById('goals-list');
+      target.innerHTML = AppState.goals.map(goal => {
+        const pct = goal.target > 0 ? Math.min(100, (goal.current / goal.target) * 100) : 0;
+        return `
+          <div class="goal-card">
+            <div class="goal-top">
+              <strong>${escapeHtml(goal.name)}</strong>
+              <span>${formatPct(pct)}</span>
+            </div>
+            <div class="progress"><div style="width:${pct}%"></div></div>
+            <div class="muted">${formatCurrency(goal.current)} of ${formatCurrency(goal.target)}</div>
+          </div>
+        `;
+      }).join('') || '<div class="signal-card">No goals yet.</div>';
+    }
+  };
+
+  const CalendarModule = {
+    bind() {
+      document.getElementById('calendar-prev').addEventListener('click', () => this.shift(-1));
+      document.getElementById('calendar-next').addEventListener('click', () => this.shift(1));
+      document.getElementById('calendar-today').addEventListener('click', async () => {
+        AppState.calendar.anchorDate = new Date().toISOString().slice(0, 10);
+        await this.load();
+      });
+      document.getElementById('calendar-month').addEventListener('click', async () => {
+        AppState.calendar.view = 'month';
+        this.syncViewButtons();
+        await this.load();
+      });
+      document.getElementById('calendar-week').addEventListener('click', async () => {
+        AppState.calendar.view = 'week';
+        this.syncViewButtons();
+        await this.load();
+      });
+      document.getElementById('calendar-note-save').addEventListener('click', () => this.saveNote());
+      document.getElementById('calendar-note-delete').addEventListener('click', () => this.deleteNote());
+    },
+
+    syncViewButtons() {
+      document.getElementById('calendar-month').classList.toggle('active', AppState.calendar.view === 'month');
+      document.getElementById('calendar-week').classList.toggle('active', AppState.calendar.view === 'week');
+    },
+
+    async load() {
+      const result = await serverCall('getCalendarData', { view: AppState.calendar.view, anchorDate: AppState.calendar.anchorDate });
+      AppState.calendar.data = result.data;
+      this.render();
+    },
+
+    async shift(direction) {
+      const base = new Date(AppState.calendar.anchorDate);
+      if (AppState.calendar.view === 'week') base.setDate(base.getDate() + (7 * direction));
+      else base.setMonth(base.getMonth() + direction);
+      AppState.calendar.anchorDate = base.toISOString().slice(0, 10);
+      await this.load();
+    },
+
+    render() {
+      this.syncViewButtons();
+      const data = AppState.calendar.data;
+      if (!data) return;
+      const grid = document.getElementById('calendar-grid');
+      const todayIso = new Date().toISOString().slice(0, 10);
+      document.getElementById('calendar-title').textContent = `${data.view === 'week' ? 'Week' : 'Month'} · ${data.startDate} to ${data.endDate}`;
+      grid.innerHTML = data.days.map(day => `
+        <button class="calendar-day ${day.date === todayIso ? 'is-today' : ''}" data-date="${day.date}">
+          <div class="calendar-day-header">
+            <strong>${escapeHtml(day.dayName)} ${day.dayNumber}</strong>
+            <span>${escapeHtml(day.note && day.note.emoji ? day.note.emoji : '')}</span>
+          </div>
+          <div class="muted">Income ${formatCurrency(day.income)}</div>
+          <div class="muted">Expense ${formatCurrency(day.expense)}</div>
+          <div class="${day.net >= 0 ? 'text-income' : 'text-expense'}">${formatSigned(day.net)}</div>
+          <div class="calendar-note">${escapeHtml(day.note && day.note.note ? day.note.note : '')}</div>
+        </button>
+      `).join('');
+      grid.querySelectorAll('.calendar-day').forEach(button => {
+        button.addEventListener('click', () => this.openDay(button.dataset.date));
+      });
+    },
+
+    async openDay(date) {
+      AppState.calendar.activeDate = date;
+      const result = await serverCall('getCalendarDayData', { date });
+      AppState.calendar.activeDayData = result.data;
+      document.getElementById('calendar-modal-title').textContent = `Day details · ${date}`;
+      document.getElementById('calendar-modal-summary').innerHTML = `
+        <span class="pill">Income ${formatCurrency(result.data.income)}</span>
+        <span class="pill">Expense ${formatCurrency(result.data.expense)}</span>
+        <span class="pill">Net ${formatSigned(result.data.net)}</span>
+      `;
+      document.getElementById('calendar-note-emoji').value = (result.data.note && result.data.note.emoji) || '';
+      document.getElementById('calendar-note-text').value = (result.data.note && result.data.note.note) || '';
+      document.getElementById('calendar-modal-transactions').innerHTML = (result.data.transactions || []).map(tx => `
+        <div class="list-item">
+          <div>
+            <strong>${escapeHtml(tx.description)}</strong>
+            <div class="muted">${escapeHtml(tx.category || 'Uncategorized')}</div>
+          </div>
+          <div class="${tx.amount >= 0 ? 'text-income' : 'text-expense'}">${formatSigned(tx.amount)}</div>
+        </div>
+      `).join('') || '<div class="signal-card">No transactions for this day.</div>';
+      document.getElementById('calendar-modal').classList.remove('hidden');
+    },
+
+    async saveNote() {
+      if (!AppState.calendar.activeDate) return;
+      const emoji = document.getElementById('calendar-note-emoji').value.trim();
+      const note = document.getElementById('calendar-note-text').value.trim();
+      const result = await serverCall('saveCalendarNote', { date: AppState.calendar.activeDate, emoji, note });
+      if (!result.success) return showToast(result.error || 'Failed to save note.', 'error');
+      showToast('Calendar note saved.', 'success');
+      await this.load();
+      await this.openDay(AppState.calendar.activeDate);
+    },
+
+    async deleteNote() {
+      if (!AppState.calendar.activeDate) return;
+      const result = await serverCall('deleteCalendarNote', { date: AppState.calendar.activeDate });
+      if (!result.success) return showToast(result.error || 'Failed to delete note.', 'error');
+      showToast('Calendar note deleted.', 'success');
+      await this.load();
+      await this.openDay(AppState.calendar.activeDate);
+    }
+  };
+
+  const InsightsModule = {
+    render() {
+      document.getElementById('ai-insights').innerHTML = `
+        <div class="signal-card">
+          <strong>AI summary</strong>
+          <div class="muted">${escapeHtml(AppState.insights || 'Insights will appear once enough data is available.')}</div>
+        </div>
+      `;
+      const recurring = (AppState.bundle && AppState.bundle.lists && AppState.bundle.lists.recurringCandidates) || [];
+      const actions = [
+        { title: 'Review top merchant', body: AppState.bundle && AppState.bundle.lists.topMerchants && AppState.bundle.lists.topMerchants[0] ? AppState.bundle.lists.topMerchants[0].name : 'No merchant pattern yet' },
+        { title: 'Budget attention', body: AppState.budgets.length ? 'Open the budget page to review actual vs plan.' : 'Create your first budget with smart suggestions.' }
+      ].concat(recurring.slice(0, 3).map(item => ({
+        title: item.description || 'Recurring signal',
+        body: `Potential recurring spend around ${formatCurrency(item.avgAmount || item.amount || 0)}`
+      })));
+      document.getElementById('insight-actions').innerHTML = actions.map(item => `
+        <div class="signal-card">
+          <strong>${escapeHtml(item.title)}</strong>
+          <div class="muted">${escapeHtml(item.body)}</div>
+        </div>
+      `).join('');
+    }
+  };
+
+  const SettingsModule = {
+    bind() {
+      document.getElementById('save-settings-btn').addEventListener('click', () => this.saveSource());
+      document.getElementById('test-source-btn').addEventListener('click', () => this.testSource());
+    },
+
+    async load() {
+      const [settings, sourceInfo] = await Promise.all([
+        serverCall('loadUserSettings'),
+        serverCall('getSourceInfo')
+      ]);
+      AppState.settings = settings.data || {};
+      AppState.sourceInfo = sourceInfo.data || {};
+      this.render();
+    },
+
+    render() {
+      document.getElementById('source-type').value = AppState.settings.source || 'active';
+      document.getElementById('external-sheet-id').value = AppState.settings.externalId || AppState.sourceInfo.sourceSpreadsheetId || '';
+      document.getElementById('source-info').innerHTML = [
+        { label: 'Sheet', value: AppState.sourceInfo.spreadsheetName || 'Unknown' },
+        { label: 'Records', value: String(AppState.sourceInfo.recordCount || 0) },
+        { label: 'Transaction tab', value: AppState.sourceInfo.txSheet || 'Transactions' }
+      ].map(item => `<div class="source-row"><strong>${escapeHtml(item.label)}</strong><div class="muted">${escapeHtml(item.value)}</div></div>`).join('');
+      renderThemes();
+    },
+
+    async saveSource() {
+      const sourceType = document.getElementById('source-type').value;
+      const externalId = document.getElementById('external-sheet-id').value.trim();
+      const result = await serverCall('updateDataSource', sourceType, externalId);
+      if (result.status !== 'success') return showToast(result.message || 'Failed to save source settings.', 'error');
+      await serverCall('saveUserSettings', { ...AppState.settings, source: sourceType, externalId, theme: AppState.theme });
+      showToast('Source settings saved.', 'success');
+      await this.load();
+      await DataLoader.reloadAll();
+    },
+
+    async testSource() {
+      const externalId = document.getElementById('external-sheet-id').value.trim();
+      if (!externalId) return showToast('Enter a Google Sheet ID first.', 'error');
+      const result = await serverCall('testExternalConnection', externalId);
+      showToast(result.success ? `Connected to ${result.name}.` : (result.message || 'Connection failed'), result.success ? 'success' : 'error');
+    }
+  };
+
+  function renderThemes() {
+    const target = document.getElementById('theme-swatches');
+    if (!target) return;
+    target.innerHTML = ThemeOptions.map(theme => `
+      <button class="theme-swatch ${theme.preview} ${AppState.theme === theme.id ? 'active' : ''}" data-theme="${theme.id}">
+        ${escapeHtml(theme.label)}
+      </button>
+    `).join('');
+    target.querySelectorAll('[data-theme]').forEach(button => {
+      button.addEventListener('click', async () => {
+        applyTheme(button.dataset.theme);
+        await serverCall('saveUserSettings', { ...AppState.settings, theme: AppState.theme, source: document.getElementById('source-type').value, externalId: document.getElementById('external-sheet-id').value.trim() });
+      });
+    });
+  }
+
+  const SystemModule = {
+    bind() {
+      document.getElementById('refresh-logs-btn').addEventListener('click', () => this.load());
+    },
+
+    async load() {
+      const [health, diagnostics, logs] = await Promise.all([
+        serverCall('getHealthReport'),
+        serverCall('getDiagnostics'),
+        serverCall('getSystemLogEntries')
+      ]);
+      AppState.healthReport = health.data || null;
+      AppState.diagnostics = diagnostics || null;
+      AppState.logs = (logs && logs.entries) || [];
+      this.render();
+    },
+
+    render() {
+      document.getElementById('health-report').innerHTML = AppState.healthReport ? `
+        <div class="signal-card"><strong>Quality score</strong><div>${escapeHtml(String(AppState.healthReport.score))}/100</div></div>
+        <div class="signal-card"><strong>Missing categories</strong><div>${escapeHtml(String(AppState.healthReport.issues.missingCategory || 0))}</div></div>
+        <div class="signal-card"><strong>Possible duplicates</strong><div>${escapeHtml(String((AppState.healthReport.issues.duplicates || []).length))}</div></div>
+        <div class="signal-card"><strong>Future dates</strong><div>${escapeHtml(String(AppState.healthReport.issues.futureDates || 0))}</div></div>
+      ` : '<div class="signal-card">Health report unavailable.</div>';
+      document.getElementById('diagnostics-report').innerHTML = AppState.diagnostics ? `
+        <div class="signal-card"><strong>Connection</strong><div class="muted">${escapeHtml(JSON.stringify(AppState.diagnostics.connection || {}))}</div></div>
+        <div class="signal-card"><strong>Last error</strong><div class="muted">${escapeHtml(AppState.diagnostics.lastError ? JSON.stringify(AppState.diagnostics.lastError) : 'None')}</div></div>
+        <div class="signal-card"><strong>Cache age</strong><div class="muted">${escapeHtml(String(AppState.diagnostics.cacheAgeMs || 0))} ms</div></div>
+      ` : '<div class="signal-card">Diagnostics unavailable.</div>';
+      document.getElementById('system-logs').textContent = AppState.logs.length ? AppState.logs.map(entry => `[${entry.level}] ${entry.message || ''} (${entry.source || 'System'})`).join('\n') : 'No recent logs.';
+    }
+  };
+
+  const ForecastModule = {
+    bind() {
+      document.getElementById('add-account-btn').addEventListener('click', () => {
+        AppState.accounts.push({ name: '', balance: 0 });
+        this.renderAccounts();
+      });
+      document.getElementById('save-accounts-btn').addEventListener('click', () => this.save());
+    },
+
+    async load() {
+      const accounts = await serverCall('getAccounts');
+      AppState.accounts = Array.isArray(accounts) ? accounts : [];
+      this.renderAccounts();
+      this.renderChart();
+    },
+
+    renderAccounts() {
+      const target = document.getElementById('accounts-list');
+      target.innerHTML = AppState.accounts.map((account, index) => `
+        <div class="account-row">
+          <input class="control-input account-name" data-index="${index}" value="${escapeHtml(account.name || '')}" placeholder="Account name">
+          <input class="control-input account-balance" data-index="${index}" type="number" value="${Number(account.balance) || 0}">
+        </div>
+      `).join('') || '<div class="signal-card">No accounts yet.</div>';
+      target.querySelectorAll('.account-name').forEach(input => {
+        input.addEventListener('input', event => {
+          AppState.accounts[Number(event.target.dataset.index)].name = event.target.value;
+        });
+      });
+      target.querySelectorAll('.account-balance').forEach(input => {
+        input.addEventListener('input', event => {
+          AppState.accounts[Number(event.target.dataset.index)].balance = Number(event.target.value) || 0;
+        });
+      });
+    },
+
+    renderChart() {
+      const forecast = AppState.chartPack && AppState.chartPack.forecast;
+      if (!forecast) return;
+      const node = document.getElementById('forecast-chart');
+      if (!node) return;
+      Plotly.react(node, [{
+        x: forecast.labels,
+        y: forecast.balance,
+        type: 'scatter',
+        mode: 'lines+markers',
+        line: { color: '#79a8ff', width: 3 }
+      }], ChartRenderer.baseLayout(''), { displayModeBar: false, responsive: true });
+    },
+
+    async save() {
+      const payload = {
+        assets: AppState.accounts.filter(item => Number(item.balance) >= 0).map(item => ({ name: item.name || 'Asset', value: Number(item.balance) || 0 })),
+        liabilities: AppState.accounts.filter(item => Number(item.balance) < 0).map(item => ({ name: item.name || 'Liability', value: Math.abs(Number(item.balance) || 0) }))
+      };
+      const result = await serverCall('saveNetWorth', payload);
+      showToast(result.status === 'success' ? 'Accounts saved.' : (result.message || 'Save failed'), result.status === 'success' ? 'success' : 'error');
+    }
+  };
+
+  const LabsModule = {
+    bind() {
+      document.getElementById('labs-test-btn').addEventListener('click', () => this.runTest());
+      document.getElementById('labs-clear-cache-btn').addEventListener('click', () => this.clearCaches());
+      document.getElementById('labs-reload-btn').addEventListener('click', () => DataLoader.reloadAll());
+      document.getElementById('import-btn').addEventListener('click', () => this.importCsv());
+    },
+
+    async runTest() {
+      const result = await serverCall('testGetDashboardData');
+      document.getElementById('labs-results').innerHTML = `
+        <div class="signal-card">
+          <strong>testGetDashboardData</strong>
+          <div class="muted">${escapeHtml(result.success ? 'Success' : (result.error || 'Failed'))}</div>
+        </div>
+      `;
+    },
+
+    async clearCaches() {
+      const result = await serverCall('labsClearCaches');
+      showToast(result.status === 'success' ? 'Caches cleared.' : (result.message || 'Failed to clear caches'), result.status === 'success' ? 'success' : 'error');
+    },
+
+    async importCsv() {
+      const input = document.getElementById('import-file');
+      const file = input.files && input.files[0];
+      if (!file) return showToast('Choose a CSV file first.', 'error');
+      const text = await file.text();
+      const rows = parseCsv(text);
+      if (!rows.length) return showToast('No importable rows were found.', 'error');
+      showLoader(true);
+      try {
+        const result = await serverCall('processImportData', rows);
+        if (!result || result.success === false) throw new Error(result && result.message ? result.message : 'Import failed');
+        showToast(`Imported ${result.count || 0} rows.`, 'success');
+        await DataLoader.reloadAll();
+      } catch (error) {
+        showToast(error.message, 'error');
+      } finally {
+        showLoader(false);
+      }
+    }
+  };
+
+  const ExportModule = {
+    async exportCsv() {
+      const result = await serverCall('exportData', currentRangeOpts());
+      if (!result.success) return showToast(result.error || 'Export failed.', 'error');
+      const blob = new Blob([result.data.content], { type: 'text/csv;charset=utf-8' });
+      const link = document.createElement('a');
+      link.href = URL.createObjectURL(blob);
+      link.download = result.data.filename || 'export.csv';
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      showToast(`Exported ${result.data.rowCount || 0} rows.`, 'success');
+    }
+  };
+
+  const CommandPalette = {
+    bind() {
+      document.getElementById('command-search').addEventListener('input', () => this.render());
+    },
+
+    open() {
+      document.getElementById('command-palette').classList.remove('hidden');
+      document.getElementById('command-search').value = '';
+      CommandPalette.render();
+      document.getElementById('command-search').focus();
+    },
+
+    items() {
+      return [
+        ...Object.keys(PageMeta).map(route => ({
+          label: `Go to ${PageMeta[route][0]}`,
+          detail: PageMeta[route][1],
+          run: () => Router.go(route)
+        })),
+        { label: 'Sync from source', detail: 'Refresh backend data and reload the Classic app.', run: () => document.getElementById('sync-btn').click() },
+        { label: 'Export current range', detail: 'Download CSV for the selected range.', run: () => document.getElementById('export-btn').click() },
+        { label: 'Reload diagnostics', detail: 'Refresh health, diagnostics, and logs.', run: () => SystemModule.load() }
+      ];
+    },
+
+    render() {
+      const term = document.getElementById('command-search').value.trim().toLowerCase();
+      const target = document.getElementById('command-results');
+      const items = this.items().filter(item => !term || item.label.toLowerCase().includes(term) || item.detail.toLowerCase().includes(term));
+      target.innerHTML = items.map((item, index) => `
+        <button class="command-item" data-command-index="${index}">
+          <strong>${escapeHtml(item.label)}</strong>
+          <div class="muted">${escapeHtml(item.detail)}</div>
+        </button>
+      `).join('') || '<div class="signal-card">No matching command.</div>';
+      target.querySelectorAll('[data-command-index]').forEach((button, index) => {
+        button.addEventListener('click', () => {
+          items[index].run();
+          document.getElementById('command-palette').classList.add('hidden');
+        });
+      });
+    }
+  };
+
+  function parseCsv(text) {
+    const rows = text.split(/\r?\n/).filter(Boolean);
+    if (rows.length < 2) return [];
+    const headers = parseCsvLine(rows[0]).map(h => h.trim().toLowerCase());
+    const dateIndex = headers.indexOf('date');
+    const descriptionIndex = headers.indexOf('description');
+    const amountIndex = headers.indexOf('amount');
+    const categoryIndex = headers.indexOf('category');
+    if (dateIndex < 0 || descriptionIndex < 0 || amountIndex < 0) return [];
+    return rows.slice(1).map(parseCsvLine).filter(cols => cols.length >= 3).map(cols => ({
+      date: cols[dateIndex],
+      description: cols[descriptionIndex],
+      amount: cols[amountIndex],
+      category: categoryIndex >= 0 ? cols[categoryIndex] : 'Uncategorized'
+    })).filter(row => row.date && row.description && row.amount !== '');
+  }
+
+  function parseCsvLine(line) {
+    const values = [];
+    let current = '';
+    let inQuotes = false;
+    for (let i = 0; i < line.length; i += 1) {
+      const char = line[i];
+      const next = line[i + 1];
+      if (char === '"' && inQuotes && next === '"') {
+        current += '"';
+        i += 1;
+      } else if (char === '"') {
+        inQuotes = !inQuotes;
+      } else if (char === ',' && !inQuotes) {
+        values.push(current);
+        current = '';
       } else {
-        showError(result && result.message ? result.message : 'Import failed');
-      }
-    }, null, 'Import process failed');
-
-    showLoader(false);
-  }
-
-  function resetImport() {
-    _importCSVData = null;
-    document.getElementById('import-step-1').style.display = 'block';
-    document.getElementById('import-step-2').style.display = 'none';
-    document.getElementById('csv-file').value = '';
-  }
-
-  function openImportWizard() {
-    document.getElementById('import-modal').style.display = 'block';
-    resetImport();
-  }
-
-  function closeImportWizard() {
-    document.getElementById('import-modal').style.display = 'none';
-  }
-
-  // ============================================
-  // THEME MANAGEMENT
-  // ============================================
-  function setTheme(themeName) {
-    const themeClass = themeName ? 'theme-' + themeName : '';
-    document.body.className = themeClass || 'theme-dark';
-    localStorage.setItem('appTheme', themeClass || 'theme-dark');
-    
-    // Update active swatch
-    document.querySelectorAll('.theme-swatch').forEach(s => 
-      s.classList.remove('active')
-    );
-    if (themeName) {
-      document.querySelector(`.theme-swatch[data-theme="${themeName}"]`)
-        ?.classList.add('active');
-    }
-
-    // Refresh charts with new theme
-    if (AppState.data) {
-      renderDashboardCharts();
-    }
-
-    showToast(`Theme changed to ${themeName || 'Default'}`, 'info');
-  }
-
-  function toggleFab(btn) {
-    btn.classList.toggle('active');
-    const menu = btn.previousElementSibling;
-    if (menu) menu.classList.toggle('show');
-  }
-
-  // ============================================
-  // LABS: diagnostics, health check, logs
-  // ============================================
-  function scriptRunWithTimeout(fnName, timeoutMs) {
-    timeoutMs = timeoutMs || 30000;
-    return new Promise(function(resolve, reject) {
-      var resolved = false;
-      var t = setTimeout(function() {
-        if (resolved) return;
-        resolved = true;
-        reject(new Error('Request timed out after ' + (timeoutMs / 1000) + 's'));
-      }, timeoutMs);
-      google.script.run
-        .withSuccessHandler(function(result) {
-          if (resolved) return;
-          resolved = true;
-          clearTimeout(t);
-          resolve(result);
-        })
-        .withFailureHandler(function(err) {
-          if (resolved) return;
-          resolved = true;
-          clearTimeout(t);
-          reject(err);
-        })[fnName].apply(google.script.run, Array.prototype.slice.call(arguments, 2));
-    });
-  }
-  function runHealthCheckFromLabs() {
-    var el = document.getElementById('labs-connection');
-    if (el) el.innerHTML = 'Running health check...';
-    google.script.run
-      .withSuccessHandler(function(r) {
-        var el = document.getElementById('labs-connection');
-        if (!el) return;
-        el.innerHTML = 'Health check: ' + (r.success ? 'OK' : 'FAILED') + (r.message ? ' – ' + r.message : '') + (r.rowCount !== undefined ? ' (rows: ' + r.rowCount + ')' : '');
-        el.style.color = r.success ? 'var(--success)' : 'var(--danger)';
-      })
-      .withFailureHandler(function(err) {
-        var el = document.getElementById('labs-connection');
-        if (el) { el.innerHTML = 'Health check error: ' + (err && err.message ? err.message : err); el.style.color = 'var(--danger)'; }
-      })
-      .checkDataConnection();
-  }
-  function runTestFromLabs() {
-    showToast('Running testGetDashboardData...', 'info');
-    google.script.run
-      .withSuccessHandler(function(r) {
-        showToast(r.success ? 'Test passed. Check Apps Script logs.' : 'Test failed: ' + (r.error || ''), r.success ? 'success' : 'error');
-      })
-      .withFailureHandler(function(err) { showToast('Test error: ' + (err && err.message ? err.message : err), 'error'); })
-      .testGetDashboardData();
-  }
-  function refreshLabsLogs() {
-    google.script.run
-      .withSuccessHandler(function(r) {
-        var pre = document.getElementById('labs-log-entries');
-        if (!pre) return;
-        if (!r.success || !r.entries || !r.entries.length) { pre.textContent = r.error || 'No log entries.'; return; }
-        pre.textContent = r.entries.slice().reverse().map(function(e) {
-          return (e.t || '') + ' [' + (e.level || '') + '] ' + (e.source || '') + ': ' + (e.message || '') + (e.detail ? ' | ' + e.detail : '');
-        }).join('\n');
-      })
-      .withFailureHandler(function() {
-        var pre = document.getElementById('labs-log-entries');
-        if (pre) pre.textContent = 'Failed to load logs.';
-      })
-      .getSystemLogEntries();
-  }
-  function runLabsDiagnostics() {
-    google.script.run
-      .withSuccessHandler(function(d) {
-        var el = document.getElementById('labs-connection');
-        if (!el) return;
-        var s = 'Connection: ' + (d.connection && d.connection.success ? 'OK' : 'FAIL') + (d.connection && d.connection.message ? ' – ' + d.connection.message : '');
-        if (d.lastError) s += '\nLast error: ' + (d.lastError.message || '') + ' @ ' + (d.lastError.source || '');
-        if (d.cacheAgeMs != null) s += '\nCache age: ' + Math.round(d.cacheAgeMs / 1000) + 's';
-        el.innerHTML = s.replace(/\n/g, '<br>');
-        el.style.color = (d.connection && d.connection.success) ? 'var(--success)' : 'var(--danger)';
-      })
-      .withFailureHandler(function(err) {
-        var el = document.getElementById('labs-connection');
-        if (el) { el.innerHTML = 'Diagnostics error: ' + (err && err.message ? err.message : err); el.style.color = 'var(--danger)'; }
-      })
-      .getDiagnostics();
-  }
-  window.runHealthCheckFromLabs = runHealthCheckFromLabs;
-  window.runTestFromLabs = runTestFromLabs;
-  window.refreshLabsLogs = refreshLabsLogs;
-
-  // ============================================
-  // PAGE NAVIGATION
-  // ============================================
-  function showPage(pageId) {
-    // Hide all pages
-    document.querySelectorAll('#page-content > div[id$="-view"]').forEach(div => {
-      div.style.display = 'none';
-    });
-
-    // Show selected page
-    const target = document.getElementById(pageId + '-view');
-    if (target) {
-      target.style.display = 'block';
-      
-      // Page-specific handlers
-      switch(pageId) {
-        case 'dashboard':
-          setTimeout(() => {
-            Object.keys(AppState.chartInstances).forEach(id => {
-              Plotly.relayout(id, {});
-            });
-          }, 100);
-          break;
-          
-        case 'calendar':
-          if (AppState.calendar) {
-            setTimeout(() => AppState.calendar.updateSize(), 100);
-          } else {
-            initializeCalendar();
-          }
-          break;
-          
-        case 'budgets':
-          loadSmartSuggestions();
-          break;
-          
-        case 'networth':
-          calculateNetWorthTotal();
-          break;
-        case 'labs':
-          refreshLabsLogs();
-          if (document.getElementById('labs-diagnostics-toggle') && document.getElementById('labs-diagnostics-toggle').checked) runLabsDiagnostics();
-          break;
+        current += char;
       }
     }
-
-    // Update active nav item
-    document.querySelectorAll('.nav-item').forEach(item => {
-      item.classList.remove('active');
-    });
-    document.querySelector(`.nav-item[onclick*="${pageId}"]`)?.classList.add('active');
+    values.push(current);
+    return values.map(value => value.trim());
   }
-
-  // ============================================
-  // MODAL MANAGEMENT
-  // ============================================
-  function closeModal(modalId) {
-    const modal = document.getElementById(modalId);
-    if (modal) {
-      modal.style.display = 'none';
-      
-      // Clean up chart instance if modal has one
-      if (modalId === 'kpi-detail-modal' && AppState.modalChartInstance) {
-        AppState.modalChartInstance.destroy();
-        AppState.modalChartInstance = null;
-      }
-    }
-  }
-
-  function closeAllModals() {
-    const modals = ['tiny-modal', 'kpi-detail-modal', 'import-modal', 'error-modal'];
-    modals.forEach(id => closeModal(id));
-  }
-
-  // ============================================
-  // UTILITY FUNCTIONS
-  // ============================================
-  function formatDate(dateStr, format = 'short') {
-    if (!dateStr) return '';
-    try {
-      const d = new Date(dateStr);
-      if (isNaN(d.getTime())) return dateStr;
-      
-      if (format === 'short') {
-        return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-      }
-      return d.toLocaleDateString('en-US', { 
-        weekday: 'short',
-        year: 'numeric', 
-        month: 'short', 
-        day: 'numeric' 
-      });
-    } catch (e) {
-      return dateStr;
-    }
-  }
-
-  function escapeHtml(text) {
-    if (!text) return '';
-    const div = document.createElement('div');
-    div.textContent = text;
-    return div.innerHTML;
-  }
-
-  function showQuickSearch() {
-    // Implement quick search functionality
-    showToast('Quick search coming soon!', 'info');
-  }
-
-  function showError(message) {
-    const modal = document.getElementById('error-modal');
-    const text = document.getElementById('error-text');
-    if (text) text.textContent = message;
-    if (modal) modal.style.display = 'block';
-    console.error('Error:', message);
-  }
-
-  function closeErrorModal() {
-    document.getElementById('error-modal').style.display = 'none';
-  }
-
-  // ============================================
-  // SERVICE WORKER (Optional PWA support)
-  // ============================================
-  function initializeServiceWorker() {
-    if ('serviceWorker' in navigator && location.protocol === 'https:') {
-      navigator.serviceWorker.register('/sw.js').catch(err => {
-        console.log('ServiceWorker registration failed:', err);
-      });
-    }
-  }
-
-  // ============================================
-  // GLOBAL EXPORTS
-  // ============================================
-  window.showPage = showPage;
-  window.setTheme = setTheme;
-  window.toggleFab = toggleFab;
-  window.openImportWizard = openImportWizard;
-  window.closeImportWizard = closeImportWizard;
-  window.closeTinyModal = closeTinyModal;
-  window.loadSmartSuggestions = loadSmartSuggestions;
-  window.saveAllBudgets = saveAllBudgets;
-  window.openKpiDetail = openKpiDetail;
-  window.closeModal = closeModal;
-  window.showToast = showToast;
-  window.runForecast = runForecast;
-  window.saveAllSettings = saveAllSettings;
-  window.addAssetRow = addAssetRow;
-  window.removeAssetRow = removeAssetRow;
-  window.syncNetWorth = syncNetWorth;
-  window.toggleExternalInput = toggleExternalInput;
-  window.verifyConnection = verifyConnection;
-  window.executeImport = executeImport;
-  window.closeErrorModal = closeErrorModal;
-  window.refreshData = () => loadDashboardData(true);
-  // ============================================
-// DATE RANGE FILTER (Integrated with AppState)
-// ============================================
-(function() {
-  window.setQuickRange = function(range) {
-    const startEl = document.getElementById('start-date');
-    const endEl = document.getElementById('end-date');
-    if (!startEl || !endEl) return;
-    const today = new Date();
-    let startDate = new Date();
-    switch(range) {
-      case 'month':
-        startDate = new Date(today.getFullYear(), today.getMonth(), 1);
-        break;
-      case 'quarter':
-        startDate = new Date(today);
-        startDate.setMonth(today.getMonth() - 3);
-        break;
-      case 'year':
-        startDate = new Date(today.getFullYear(), 0, 1);
-        break;
-      case 'all':
-        startDate = new Date(2000, 0, 1);
-        break;
-    }
-    startEl.value = formatDateForInput(startDate);
-    endEl.value = formatDateForInput(today);
-    applyDateFilter();
-  };
-
-  window.formatDateForInput = function(date) {
-    const year = date.getFullYear();
-    const month = String(date.getMonth() + 1).padStart(2, '0');
-    const day = String(date.getDate()).padStart(2, '0');
-    return `${year}-${month}-${day}`;
-  };
-
-  window.applyDateFilter = function() {
-    if (!AppState.data || !Array.isArray(AppState.data.transactions) || AppState.data.transactions.length === 0) {
-      if (!window._noDataToastShown) {
-        window._noDataToastShown = true;
-        showToast('Load data first: open the spreadsheet, run Initialize System, then click Sync from source.', 'warning', 6000);
-      }
-      return;
-    }
-    var startEl = document.getElementById('start-date');
-    var endEl = document.getElementById('end-date');
-    if (!startEl || !endEl) {
-      showToast('Date filter UI not available', 'warning');
-      return;
-    }
-    var startDate = startEl.value;
-    var endDate = endEl.value;
-    if (!startDate || !endDate) {
-      showToast('Please select both start and end dates', 'warning');
-      return;
-    }
-    AppState.dateRange = { start: startDate, end: endDate };
-    refreshDateDrivenViews();
-    var count = getFilteredTransactions().length;
-    showToast('Showing ' + count + ' transactions in range', 'success');
-  };
-
-  window.clearFilter = function() {
-    AppState.dateRange = { start: null, end: null };
-    var summaryEl = document.getElementById('filtered-summary');
-    var startEl = document.getElementById('start-date');
-    var endEl = document.getElementById('end-date');
-    if (summaryEl) summaryEl.style.display = 'none';
-    if (startEl) startEl.value = '';
-    if (endEl) endEl.value = '';
-    refreshDateDrivenViews();
-    showToast('Showing all data', 'info');
-  };
-})();
-// ============================================
-// SYNC BUTTON FUNCTIONALITY (Integrated)
-// ============================================
-(function() {
-  // Initialize last sync time from localStorage
-  let lastSyncTime = localStorage.getItem('lastSyncTime') || null;
-  
-  // Function to update the sync button state and last sync display
-  function updateSyncUI(isSyncing = false) {
-    const syncBtn = document.getElementById('sync-button');
-    const syncIcon = document.getElementById('sync-icon');
-    const lastSyncEl = document.getElementById('last-sync-time');
-    if (!syncBtn) return;
-    
-    if (isSyncing) {
-      syncBtn.disabled = true;
-      syncBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Syncing...';
-      if (syncIcon) syncIcon.className = 'fas fa-spinner fa-spin';
-    } else {
-      syncBtn.disabled = false;
-      syncBtn.innerHTML = '<i class="fas fa-sync-alt"></i> Sync Now';
-      if (syncIcon) syncIcon.className = 'fas fa-sync-alt';
-    }
-    
-    if (lastSyncEl && lastSyncTime) {
-      lastSyncEl.innerText = `Last sync: ${lastSyncTime}`;
-    }
-  }
-  
-  // Manual sync function
-  window.manualSync = async function() {
-    const syncBtn = document.getElementById('sync-button');
-    if (!syncBtn) return;
-    
-    // Prevent multiple syncs
-    if (syncBtn.disabled) return;
-    
-    updateSyncUI(true);
-    showLoader(true);
-    
-    try {
-      // Force refresh: bypass both client and server caches
-      await new Promise((resolve, reject) => {
-        google.script.run
-          .withSuccessHandler(resolve)
-          .withFailureHandler(reject)
-          .getDashboardData(true);
-      }).then(function(response) {
-        var data = (response && response.data) ? response.data : response;
-        if (!data) return;
-        AppState.update('data', data);
-        updateKPIs(data.kpis);
-        renderDashboardCharts();
-        initializeCalendar();
-        initializeNetWorth();
-        lastSyncTime = new Date().toLocaleString();
-        localStorage.setItem('lastSyncTime', lastSyncTime);
-        if (document.getElementById('budgets-view') && document.getElementById('budgets-view').style.display === 'block') loadSmartSuggestions();
-        showToast(response.success !== false ? 'Dashboard synced successfully!' : (response.error || 'Synced with warnings'), response.success !== false ? 'success' : 'warning');
-      });
-    } catch (error) {
-      showError('Sync failed: ' + error.message);
-    } finally {
-      showLoader(false);
-      updateSyncUI(false);
-    }
-  };
-  
-  // Initialize last sync display on page load
-  function initSyncDisplay() {
-    const lastSyncEl = document.getElementById('last-sync-time');
-    if (lastSyncEl && lastSyncTime) {
-      lastSyncEl.innerText = `Last sync: ${lastSyncTime}`;
-    }
-  }
-  
-  // Hook into existing DOMContentLoaded (safe to add another listener)
-  document.addEventListener('DOMContentLoaded', initSyncDisplay);
-})();
 </script>

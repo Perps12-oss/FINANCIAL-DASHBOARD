@@ -93,7 +93,9 @@ const _Config = (function() {
 })();
 
 /**
- * Fetches and parses transaction data with in-memory caching.
+ * SINGLE SOURCE OF TRUTH for transaction data.
+ * All dashboards (Classic, SACRED) and APIs (getDashboardData, getDashboardSummary, getTransactionsPaginated, etc.)
+ * must use this function only – no second “validation” read that can contradict it.
  * @param {boolean} [useCache=true]
  * @returns {{ transactions: Array, totalRows: number, validation: { valid: boolean, errors: string[], warnings: string[] } }}
  */
@@ -164,6 +166,615 @@ function _getCoreTransactionData() {
     }
     return { rows: [], error: e.message || 'Connection failed.' };
   }
+}
+
+/**
+ * Filter transactions by range. range: '7d'|'30d'|'90d'|'6m'|'1y'|'all'|'custom'.
+ * For 'custom', fromIso and toIso must be YYYY-MM-DD.
+ * @returns {Array} Filtered transactions (same objects).
+ */
+function _filterTransactionsByRange(txs, range, fromIso, toIso) {
+  if (!txs || !txs.length) return [];
+  var start = null;
+  var end = null;
+  if (range === 'custom' && fromIso && toIso) {
+    start = new Date(fromIso);
+    end = new Date(toIso);
+    end.setHours(23, 59, 59);
+  } else {
+    var now = new Date();
+    end = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59);
+    start = new Date(now.getTime());
+    if (range === '7d') start.setDate(start.getDate() - 7);
+    else if (range === '30d') start.setDate(start.getDate() - 30);
+    else if (range === '90d') start.setDate(start.getDate() - 90);
+    else if (range === '6m') start.setMonth(start.getMonth() - 6);
+    else if (range === '1y') start.setFullYear(start.getFullYear() - 1);
+    else if (range === 'all') return txs;
+    else start.setDate(start.getDate() - 30);
+  }
+  return txs.filter(function(t) {
+    var d = new Date(t.date);
+    return d >= start && d <= end;
+  });
+}
+
+/**
+ * Build dashboard summary for SACRED: KPIs + lists (recent, top merchants, top income, recurring).
+ * Transactions in lists use { name, date, category, amount } (name = description).
+ */
+function _getDashboardSummaryData(range, fromIso, toIso) {
+  var txResult = _getTransactions(true);
+  var all = (txResult && txResult.transactions) ? txResult.transactions : [];
+  var txs = _filterTransactionsByRange(all, range || '30d', fromIso, toIso);
+  var kpis = _calculateKPIs(all);
+  var balance = parseFloat(kpis.balance) || 0;
+  var income = txs.filter(function(t) { return t.amount > 0; }).reduce(function(s, t) { return s + t.amount; }, 0);
+  var expenses = Math.abs(txs.filter(function(t) { return t.amount < 0; }).reduce(function(s, t) { return s + t.amount; }, 0));
+  var netCashFlow = income - expenses;
+  var savingsRate = income > 0 ? ((income - expenses) / income) * 100 : 0;
+  var daysToPayday = _getDaysToPayday();
+
+  var topIncomeMap = {};
+  txs.filter(function(t) { return t.amount > 0; }).forEach(function(t) {
+    var name = t.description || 'Income';
+    topIncomeMap[name] = (topIncomeMap[name] || 0) + t.amount;
+  });
+  var topIncomeSources = Object.entries(topIncomeMap).map(function(e) { return { name: e[0], amount: e[1], transactions: 0 }; });
+  txs.filter(function(t) { return t.amount > 0; }).forEach(function(t) {
+    var name = t.description || 'Income';
+    var o = topIncomeSources.find(function(x) { return x.name === name; });
+    if (o) o.transactions = (o.transactions || 0) + 1;
+  });
+  topIncomeSources.sort(function(a, b) { return b.amount - a.amount; });
+
+  var merchantMap = {};
+  txs.filter(function(t) { return t.amount < 0; }).forEach(function(t) {
+    var name = t.description || t.category || 'Expense';
+    merchantMap[name] = (merchantMap[name] || { amount: 0, count: 0 });
+    merchantMap[name].amount += Math.abs(t.amount);
+    merchantMap[name].count += 1;
+  });
+  var topMerchants = Object.entries(merchantMap).map(function(e) { return { name: e[0], amount: e[1].amount, transactions: e[1].count }; });
+  topMerchants.sort(function(a, b) { return b.amount - a.amount; });
+
+  var recentSlice = txs.slice().reverse().slice(0, 25);
+  var recentTransactions = recentSlice.map(function(t) {
+    return { name: t.description || '', date: t.date || '', category: t.category || 'Uncategorized', amount: t.amount };
+  });
+
+  var recurringCandidates = _getRecurringCandidatesList(all);
+
+  return {
+    kpis: {
+      currentBalance: balance,
+      totalIncome: income,
+      totalExpenses: expenses,
+      netCashFlow: netCashFlow,
+      savingsRate: savingsRate,
+      daysUntilPayday: daysToPayday
+    },
+    lists: {
+      recentTransactions: recentTransactions,
+      topMerchants: topMerchants.slice(0, 20),
+      topIncomeSources: topIncomeSources.slice(0, 20),
+      recurringCandidates: recurringCandidates
+    },
+    metadata: { range: range, fromIso: fromIso, toIso: toIso }
+  };
+}
+
+/**
+ * Recurring candidates: same description + same amount, at least 2 occurrences.
+ */
+function _getRecurringCandidatesList(txs) {
+  if (!txs || !txs.length) return [];
+  var keyTo = {};
+  txs.forEach(function(t) {
+    var key = (t.description || '').trim() + '|' + Number(t.amount);
+    if (!keyTo[key]) keyTo[key] = { pattern: t.description || '', totalAmount: 0, transactions: 0 };
+    keyTo[key].totalAmount += t.amount;
+    keyTo[key].transactions += 1;
+  });
+  return Object.values(keyTo).filter(function(r) { return r.transactions >= 2; }).slice(0, 30);
+}
+
+/**
+ * Charts data for range: runningBalance, incomeVsExpense, spendingByCategory, budgetVsActual.
+ */
+function _getChartsDataForRange(range, fromIso, toIso) {
+  var txResult = _getTransactions(true);
+  var txs = (txResult && txResult.transactions) ? txResult.transactions : [];
+  var filtered = _filterTransactionsByRange(txs, range || '30d', fromIso, toIso);
+  var sorted = filtered.slice().sort(function(a, b) { return new Date(a.date) - new Date(b.date); });
+
+  var running = 0;
+  var runningBalance = sorted.map(function(t) {
+    running += t.amount;
+    return { date: t.date, balance: running };
+  });
+
+  var byMonth = {};
+  filtered.forEach(function(t) {
+    var key = t.date ? t.date.substring(0, 7) : '';
+    if (!key) return;
+    if (!byMonth[key]) byMonth[key] = { income: 0, expenses: 0 };
+    if (t.amount > 0) byMonth[key].income += t.amount; else byMonth[key].expenses += Math.abs(t.amount);
+  });
+  var months = Object.keys(byMonth).sort();
+  var incomeVsExpense = months.map(function(m) {
+    var o = byMonth[m];
+    return { month: m, income: o.income, expenses: o.expenses };
+  });
+
+  var categorySpend = {};
+  filtered.filter(function(t) { return t.amount < 0; }).forEach(function(t) {
+    var cat = t.category || 'Uncategorized';
+    categorySpend[cat] = (categorySpend[cat] || 0) + Math.abs(t.amount);
+  });
+  var spendingByCategory = Object.entries(categorySpend).map(function(e) { return { category: e[0], amount: e[1] }; });
+
+  var budgetsJson = _Config.getUserProp_(_Config.KEYS.BUDGETS_PROP_KEY) || '{}';
+  var budgets = [];
+  try { budgets = JSON.parse(budgetsJson); } catch (e) {}
+  var budgetList = Array.isArray(budgets) ? budgets : (budgets.categories ? budgets.categories : Object.entries(budgets).map(function(e) { return { category: e[0], amount: e[1] }; }));
+  var actualByCat = {};
+  filtered.filter(function(t) { return t.amount < 0; }).forEach(function(t) {
+    var cat = t.category || 'Uncategorized';
+    actualByCat[cat] = (actualByCat[cat] || 0) + Math.abs(t.amount);
+  });
+  var budgetVsActual = budgetList.slice(0, 15).map(function(b) {
+    var cat = typeof b === 'object' && b.category ? b.category : (typeof b === 'string' ? b : '');
+    var budgetAmt = typeof b === 'object' && b.amount != null ? Number(b.amount) : 0;
+    return { category: cat || 'Other', budget: budgetAmt, actual: actualByCat[cat] || 0 };
+  });
+
+  return {
+    runningBalance: runningBalance,
+    incomeVsExpense: incomeVsExpense,
+    spendingByCategory: spendingByCategory,
+    budgetVsActual: budgetVsActual
+  };
+}
+
+/**
+ * Paginated transactions with optional range and type. type: 'all'|'income'|'expense'.
+ * Returns newest first. Signature for SACRED: (range, fromIso, toIso, offset, limit) or with opts.type.
+ */
+function _getTransactionsPaginatedWithRange(range, fromIso, toIso, offset, limit, type) {
+  var txResult = _getTransactions(true);
+  var all = (txResult && txResult.transactions) ? txResult.transactions : [];
+  var filtered = (range || fromIso || toIso) ? _filterTransactionsByRange(all, range || 'all', fromIso, toIso) : all;
+  if (type === 'income') filtered = filtered.filter(function(t) { return t.amount > 0; });
+  else if (type === 'expense') filtered = filtered.filter(function(t) { return t.amount < 0; });
+  var reversed = filtered.slice().reverse();
+  var start = Math.max(0, parseInt(offset, 10) || 0);
+  var pageSize = Math.min(100, Math.max(1, parseInt(limit, 10) || 25));
+  var slice = reversed.slice(start, start + pageSize);
+  return {
+    transactions: slice.map(function(t) { return { name: t.description || '', date: t.date || '', category: t.category || 'Uncategorized', amount: t.amount }; }),
+    total: reversed.length,
+    offset: start,
+    limit: pageSize
+  };
+}
+
+/**
+ * Uncategorized transactions (no category or 'Uncategorized') in range.
+ */
+function _getUncategorizedTransactions(range, fromIso, toIso) {
+  var txResult = _getTransactions(true);
+  var txs = (txResult && txResult.transactions) ? txResult.transactions : [];
+  var filtered = _filterTransactionsByRange(txs, range || 'all', fromIso, toIso);
+  return filtered.filter(function(t) {
+    var c = (t.category || '').trim();
+    return !c || c.toLowerCase() === 'uncategorized';
+  }).map(function(t) { return { date: t.date, name: t.description || '', category: t.category || '', amount: t.amount }; });
+}
+
+/**
+ * Transactions for a single day (dateStr YYYY-MM-DD).
+ */
+function _getTransactionsForDay(dateStr) {
+  if (!dateStr) return [];
+  var txResult = _getTransactions(true);
+  var txs = (txResult && txResult.transactions) ? txResult.transactions : [];
+  var dayStart = new Date(dateStr);
+  var dayEnd = new Date(dateStr);
+  dayEnd.setHours(23, 59, 59);
+  return txs.filter(function(t) {
+    var d = new Date(t.date);
+    return d >= dayStart && d <= dayEnd;
+  }).map(function(t) { return { date: t.date, description: t.description, category: t.category, amount: t.amount }; });
+}
+
+/**
+ * Analytics: category summary for range (expenses by category).
+ */
+function _getAnalyticsDataForRange(range, fromIso, toIso) {
+  var txResult = _getTransactions(true);
+  var txs = (txResult && txResult.transactions) ? txResult.transactions : [];
+  var filtered = _filterTransactionsByRange(txs, range || '30d', fromIso, toIso);
+  var categorySpend = {};
+  filtered.filter(function(t) { return t.amount < 0; }).forEach(function(t) {
+    var cat = t.category || 'Uncategorized';
+    categorySpend[cat] = (categorySpend[cat] || 0) + Math.abs(t.amount);
+  });
+  var totalExpenses = Object.values(categorySpend).reduce(function(s, v) { return s + v; }, 0);
+  var categories = Object.entries(categorySpend).map(function(e) { return { name: e[0], amount: e[1] }; }).sort(function(a, b) { return b.amount - a.amount; });
+  return { data: { categories: categories, summary: { totalExpenses: totalExpenses } } };
+}
+
+function _resolveRangeBounds_(range, fromIso, toIso) {
+  if (range === 'custom' && fromIso && toIso) {
+    return { fromIso: fromIso, toIso: toIso };
+  }
+  if (range === 'all') return { fromIso: null, toIso: null };
+  var now = new Date();
+  var end = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  var start = new Date(end.getTime());
+  if (range === '7d') start.setDate(start.getDate() - 7);
+  else if (range === '30d') start.setDate(start.getDate() - 30);
+  else if (range === '90d') start.setDate(start.getDate() - 90);
+  else if (range === '6m') start.setMonth(start.getMonth() - 6);
+  else if (range === '1y') start.setFullYear(start.getFullYear() - 1);
+  else start.setDate(start.getDate() - 30);
+  return {
+    fromIso: start.toISOString().slice(0, 10),
+    toIso: end.toISOString().slice(0, 10)
+  };
+}
+
+function _sumAmounts_(txs, predicate) {
+  return (txs || []).filter(predicate || function() { return true; }).reduce(function(sum, tx) {
+    return sum + (Number(tx.amount) || 0);
+  }, 0);
+}
+
+function _groupTransactionsByMonth_(txs) {
+  var byMonth = {};
+  (txs || []).forEach(function(tx) {
+    if (!tx.date) return;
+    var key = tx.date.substring(0, 7);
+    if (!byMonth[key]) byMonth[key] = { income: 0, expenses: 0, net: 0, transactions: [] };
+    var amount = Number(tx.amount) || 0;
+    if (amount >= 0) byMonth[key].income += amount;
+    else byMonth[key].expenses += Math.abs(amount);
+    byMonth[key].net += amount;
+    byMonth[key].transactions.push(tx);
+  });
+  return byMonth;
+}
+
+function _groupTransactionsByDay_(txs) {
+  var byDay = {};
+  (txs || []).forEach(function(tx) {
+    if (!tx.date) return;
+    if (!byDay[tx.date]) byDay[tx.date] = { income: 0, expenses: 0, net: 0, count: 0, transactions: [] };
+    var amount = Number(tx.amount) || 0;
+    if (amount >= 0) byDay[tx.date].income += amount;
+    else byDay[tx.date].expenses += Math.abs(amount);
+    byDay[tx.date].net += amount;
+    byDay[tx.date].count += 1;
+    byDay[tx.date].transactions.push(tx);
+  });
+  return byDay;
+}
+
+function _getTopCategories_(txs, limit) {
+  var categorySpend = {};
+  (txs || []).filter(function(tx) { return Number(tx.amount) < 0; }).forEach(function(tx) {
+    var category = tx.category || 'Uncategorized';
+    categorySpend[category] = (categorySpend[category] || 0) + Math.abs(Number(tx.amount) || 0);
+  });
+  return Object.entries(categorySpend)
+    .map(function(entry) { return { name: entry[0], category: entry[0], amount: Number(entry[1].toFixed(2)) }; })
+    .sort(function(a, b) { return b.amount - a.amount; })
+    .slice(0, limit || 10);
+}
+
+function _getTopMerchants_(txs, limit) {
+  var merchants = {};
+  (txs || []).filter(function(tx) { return Number(tx.amount) < 0; }).forEach(function(tx) {
+    var name = tx.description || tx.category || 'Expense';
+    if (!merchants[name]) merchants[name] = { name: name, amount: 0, transactions: 0 };
+    merchants[name].amount += Math.abs(Number(tx.amount) || 0);
+    merchants[name].transactions += 1;
+  });
+  return Object.values(merchants)
+    .sort(function(a, b) { return b.amount - a.amount; })
+    .slice(0, limit || 10)
+    .map(function(item) {
+      item.amount = Number(item.amount.toFixed(2));
+      return item;
+    });
+}
+
+function _getTopIncomeSources_(txs, limit) {
+  var income = {};
+  (txs || []).filter(function(tx) { return Number(tx.amount) > 0; }).forEach(function(tx) {
+    var name = tx.description || 'Income';
+    if (!income[name]) income[name] = { name: name, amount: 0, transactions: 0 };
+    income[name].amount += Number(tx.amount) || 0;
+    income[name].transactions += 1;
+  });
+  return Object.values(income)
+    .sort(function(a, b) { return b.amount - a.amount; })
+    .slice(0, limit || 10)
+    .map(function(item) {
+      item.amount = Number(item.amount.toFixed(2));
+      return item;
+    });
+}
+
+function _getRecentTransactions_(txs, limit) {
+  return (txs || []).slice().reverse().slice(0, limit || 25).map(function(tx) {
+    return {
+      date: tx.date || '',
+      dateFormatted: tx.date || '',
+      description: tx.description || '',
+      merchant: tx.description || '',
+      name: tx.description || '',
+      category: tx.category || 'Uncategorized',
+      amount: Number(tx.amount) || 0,
+      amountFormatted: _Config.formatCurrency_(Math.abs(Number(tx.amount) || 0)),
+      type: Number(tx.amount) >= 0 ? 'income' : 'expense'
+    };
+  });
+}
+
+function _getMonthlyCategoryMatrix_(txs, limit) {
+  var byMonth = _groupTransactionsByMonth_(txs);
+  var months = Object.keys(byMonth).sort();
+  var topCategories = _getTopCategories_(txs, limit || 8).map(function(cat) { return cat.category; });
+  var z = topCategories.map(function(category) {
+    return months.map(function(monthKey) {
+      var total = 0;
+      (byMonth[monthKey].transactions || []).forEach(function(tx) {
+        if ((tx.category || 'Uncategorized') === category && Number(tx.amount) < 0) {
+          total += Math.abs(Number(tx.amount) || 0);
+        }
+      });
+      return Number(total.toFixed(2));
+    });
+  });
+  return { months: months, categories: topCategories, z: z };
+}
+
+function _getWeekdayHeatmap_(txs) {
+  var weekdayLabels = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  var weekKeys = [];
+  var matrix = {};
+  (txs || []).forEach(function(tx) {
+    var d = new Date(tx.date);
+    if (isNaN(d.getTime())) return;
+    var weekStart = new Date(d);
+    weekStart.setDate(d.getDate() - d.getDay());
+    var weekKey = weekStart.toISOString().slice(0, 10);
+    if (weekKeys.indexOf(weekKey) === -1) weekKeys.push(weekKey);
+    if (!matrix[weekKey]) matrix[weekKey] = [0, 0, 0, 0, 0, 0, 0];
+    if (Number(tx.amount) < 0) matrix[weekKey][d.getDay()] += Math.abs(Number(tx.amount) || 0);
+  });
+  weekKeys.sort();
+  return {
+    x: weekdayLabels,
+    y: weekKeys,
+    z: weekKeys.map(function(key) { return matrix[key]; })
+  };
+}
+
+function _getForecastSeries_(txs) {
+  var projection = _calculateForecast({ incomeMod: 0, expenseMod: 0 }) || [];
+  return {
+    labels: projection.map(function(row) { return row.month; }),
+    balance: projection.map(function(row) { return Number(row.balance) || 0; }),
+    income: projection.map(function(row) { return Number(row.income) || 0; }),
+    expense: projection.map(function(row) { return Number(row.expense) || 0; }),
+    netFlow: projection.map(function(row) { return Number(row.netFlow) || 0; })
+  };
+}
+
+function _buildDashboardContext_(range, fromIso, toIso) {
+  var resolved = _resolveRangeBounds_(range || '30d', fromIso || null, toIso || null);
+  var txResult = _getTransactions(true);
+  var allTransactions = (txResult && txResult.transactions) ? txResult.transactions : [];
+  var filteredTransactions = _filterTransactionsByRange(allTransactions, range || '30d', resolved.fromIso, resolved.toIso);
+  var sortedTransactions = filteredTransactions.slice().sort(function(a, b) { return new Date(a.date) - new Date(b.date); });
+  var fullKpis = _calculateKPIs(allTransactions);
+  var income = _sumAmounts_(sortedTransactions, function(tx) { return Number(tx.amount) > 0; });
+  var expenseSigned = _sumAmounts_(sortedTransactions, function(tx) { return Number(tx.amount) < 0; });
+  var expenses = Math.abs(expenseSigned);
+  var netCashFlow = income - expenses;
+  var savingsRate = income > 0 ? ((netCashFlow / income) * 100) : 0;
+  var last30Transactions = _filterTransactionsByRange(allTransactions, '30d', null, null);
+  var burnRate = Math.abs(_sumAmounts_(last30Transactions, function(tx) { return Number(tx.amount) < 0; })) / 30;
+  var currentBalance = parseFloat(fullKpis.balance) || 0;
+  var projectedDaysToZero = burnRate > 0 ? Math.floor(currentBalance / burnRate) : null;
+  var monthly = _groupTransactionsByMonth_(sortedTransactions);
+  var daily = _groupTransactionsByDay_(sortedTransactions);
+  return {
+    range: range || '30d',
+    fromIso: resolved.fromIso,
+    toIso: resolved.toIso,
+    validation: (txResult && txResult.validation) ? txResult.validation : { valid: true, errors: [], warnings: [] },
+    allTransactions: allTransactions,
+    filteredTransactions: filteredTransactions,
+    sortedTransactions: sortedTransactions,
+    totalRows: allTransactions.length,
+    kpis: {
+      currentBalance: Number(currentBalance.toFixed(2)),
+      totalIncome: Number(income.toFixed(2)),
+      totalExpenses: Number(expenses.toFixed(2)),
+      netCashFlow: Number(netCashFlow.toFixed(2)),
+      savingsRate: Number(savingsRate.toFixed(1)),
+      daysUntilPayday: _getDaysToPayday(),
+      burnRate: Number(burnRate.toFixed(2)),
+      projectedDaysToZero: projectedDaysToZero == null ? null : Math.max(0, projectedDaysToZero),
+      avgIncome: Number(fullKpis.avgIncome || 0),
+      avgExpense: Number(fullKpis.avgExpense || 0)
+    },
+    monthly: monthly,
+    daily: daily,
+    topCategories: _getTopCategories_(sortedTransactions, 12),
+    topMerchants: _getTopMerchants_(sortedTransactions, 12),
+    topIncomeSources: _getTopIncomeSources_(sortedTransactions, 12),
+    recurringCandidates: _getRecurringCandidatesList(sortedTransactions),
+    recentTransactions: _getRecentTransactions_(sortedTransactions, 50)
+  };
+}
+
+function _buildClassicChartPack_(range, fromIso, toIso) {
+  var context = _buildDashboardContext_(range, fromIso, toIso);
+  var txs = context.sortedTransactions;
+  var running = 0;
+  var runningBalance = txs.map(function(tx) {
+    running += Number(tx.amount) || 0;
+    return { date: tx.date, balance: Number(running.toFixed(2)) };
+  });
+  var monthlyKeys = Object.keys(context.monthly).sort();
+  var incomeVsExpense = monthlyKeys.map(function(monthKey) {
+    return {
+      month: monthKey,
+      income: Number(context.monthly[monthKey].income.toFixed(2)),
+      expenses: Number(context.monthly[monthKey].expenses.toFixed(2))
+    };
+  });
+  var monthlyNet = monthlyKeys.map(function(monthKey) {
+    return { month: monthKey, net: Number(context.monthly[monthKey].net.toFixed(2)) };
+  });
+  var scatter = txs.map(function(tx) {
+    return { date: tx.date, amount: Number(tx.amount) || 0, category: tx.category || 'Uncategorized' };
+  });
+  var histogram = txs.filter(function(tx) { return Number(tx.amount) < 0; }).map(function(tx) {
+    return Math.abs(Number(tx.amount) || 0);
+  });
+  var categoryMonth = _getMonthlyCategoryMatrix_(txs, 8);
+  var weekdayHeatmap = _getWeekdayHeatmap_(txs);
+  var sankey = _getSankeyData(context.fromIso, context.toIso);
+  var matrix3D = _get3DMatrixData(context.fromIso, context.toIso);
+  var forecast = _getForecastSeries_(context.allTransactions);
+  var categoryTrends = categoryMonth.categories.map(function(category, index) {
+    return {
+      category: category,
+      values: categoryMonth.z[index]
+    };
+  });
+  var merchants = context.topMerchants.map(function(merchant) {
+    return { name: merchant.name, amount: merchant.amount, transactions: merchant.transactions };
+  });
+  return {
+    runningBalance: runningBalance,
+    categoryDonut: context.topCategories.map(function(category) {
+      return { category: category.category, amount: category.amount };
+    }),
+    incomeVsExpense: incomeVsExpense,
+    monthlyNet: monthlyNet,
+    scatter: scatter,
+    histogram: histogram,
+    categoryMonthHeatmap: { x: categoryMonth.months, y: categoryMonth.categories, z: categoryMonth.z },
+    weekdayHeatmap: weekdayHeatmap,
+    monthlyWaterfall: monthlyNet,
+    surface3D: matrix3D,
+    forecast: forecast,
+    categoryTrends: { months: categoryMonth.months, series: categoryTrends },
+    advancedTrend: monthlyKeys.map(function(monthKey) {
+      return {
+        month: monthKey,
+        totalSpending: Number(context.monthly[monthKey].expenses.toFixed(2)),
+        totalIncome: Number(context.monthly[monthKey].income.toFixed(2))
+      };
+    }),
+    sankey: sankey,
+    merchants: merchants
+  };
+}
+
+function _getCalendarNotesMap_() {
+  var raw = _Config.getUserProp_('USER_CALENDAR_NOTES') || '{}';
+  try { return JSON.parse(raw); } catch (e) { return {}; }
+}
+
+function _saveCalendarNotesMap_(map) {
+  _Config.setUserProp_('USER_CALENDAR_NOTES', JSON.stringify(map || {}));
+}
+
+function _buildCalendarWindowData_(view, anchorDate) {
+  var anchor = anchorDate ? new Date(anchorDate) : new Date();
+  if (isNaN(anchor.getTime())) anchor = new Date();
+  var start = new Date(anchor.getFullYear(), anchor.getMonth(), anchor.getDate());
+  var end = new Date(start);
+  if (view === 'week') {
+    var day = start.getDay();
+    var diff = day === 0 ? 6 : day - 1;
+    start.setDate(start.getDate() - diff);
+    end = new Date(start);
+    end.setDate(start.getDate() + 6);
+  } else {
+    start = new Date(anchor.getFullYear(), anchor.getMonth(), 1);
+    end = new Date(anchor.getFullYear(), anchor.getMonth() + 1, 0);
+  }
+  var txResult = _getTransactions(true);
+  var txs = (txResult && txResult.transactions) ? txResult.transactions : [];
+  var filtered = txs.filter(function(tx) {
+    var d = new Date(tx.date);
+    return d >= start && d <= end;
+  });
+  var daily = _groupTransactionsByDay_(filtered);
+  var notes = _getCalendarNotesMap_();
+  var days = [];
+  var cursor = new Date(start);
+  while (cursor <= end) {
+    var iso = cursor.toISOString().slice(0, 10);
+    var info = daily[iso] || { income: 0, expenses: 0, net: 0, count: 0, transactions: [] };
+    var note = notes[iso] || null;
+    days.push({
+      date: iso,
+      dayNumber: cursor.getDate(),
+      dayName: cursor.toLocaleDateString('en-US', { weekday: 'short' }),
+      income: Number(info.income.toFixed(2)),
+      expense: Number(info.expenses.toFixed(2)),
+      net: Number(info.net.toFixed(2)),
+      count: info.count,
+      note: note
+    });
+    cursor.setDate(cursor.getDate() + 1);
+  }
+  return {
+    view: view === 'week' ? 'week' : 'month',
+    anchorDate: anchor.toISOString().slice(0, 10),
+    startDate: start.toISOString().slice(0, 10),
+    endDate: end.toISOString().slice(0, 10),
+    days: days
+  };
+}
+
+function _getCalendarDayData_(dateStr) {
+  var txs = _getTransactionsForDay(dateStr) || [];
+  var note = _getCalendarNotesMap_()[dateStr] || null;
+  var income = txs.filter(function(tx) { return Number(tx.amount) > 0; }).reduce(function(sum, tx) { return sum + (Number(tx.amount) || 0); }, 0);
+  var expense = Math.abs(txs.filter(function(tx) { return Number(tx.amount) < 0; }).reduce(function(sum, tx) { return sum + (Number(tx.amount) || 0); }, 0));
+  return {
+    date: dateStr,
+    income: Number(income.toFixed(2)),
+    expense: Number(expense.toFixed(2)),
+    net: Number((income - expense).toFixed(2)),
+    note: note,
+    transactions: txs.sort(function(a, b) { return Math.abs(Number(b.amount) || 0) - Math.abs(Number(a.amount) || 0); })
+  };
+}
+
+function _getGoalsList_() {
+  var raw = _Config.getUserProp_(_Config.KEYS.GOALS_PROP_KEY) || '[]';
+  try {
+    var parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+function _saveGoalsList_(goals) {
+  _Config.setUserProp_(_Config.KEYS.GOALS_PROP_KEY, JSON.stringify(Array.isArray(goals) ? goals : []));
 }
 
 /**

@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Financial Dashboard – Start</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" crossorigin="anonymous">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      background: linear-gradient(135deg, #0a0e27 0%, #1a1f3a 50%, #0d1117 100%);
+      color: #e6edf3;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+    }
+    h1 {
+      font-size: 28px;
+      font-weight: 700;
+      margin-bottom: 8px;
+      color: #fff;
+    }
+    .subtitle {
+      color: #8b949e;
+      font-size: 14px;
+      margin-bottom: 40px;
+    }
+    .cards {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 24px;
+      justify-content: center;
+      max-width: 720px;
+    }
+    .card {
+      background: rgba(30, 41, 59, 0.8);
+      border: 1px solid rgba(148, 163, 184, 0.2);
+      border-radius: 20px;
+      padding: 32px;
+      width: 280px;
+      text-align: center;
+      text-decoration: none;
+      color: inherit;
+      transition: transform 0.2s, box-shadow 0.2s, border-color 0.2s;
+    }
+    .card:hover {
+      transform: translateY(-4px);
+      box-shadow: 0 12px 40px rgba(0, 210, 255, 0.15);
+      border-color: rgba(0, 210, 255, 0.4);
+    }
+    .card-icon {
+      width: 56px;
+      height: 56px;
+      margin: 0 auto 20px;
+      border-radius: 14px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 26px;
+    }
+    .card.classic .card-icon { background: rgba(0, 210, 255, 0.2); color: #00d2ff; }
+    .card.sacred .card-icon { background: rgba(138, 43, 226, 0.2); color: #8a2be2; }
+    .card h2 { font-size: 18px; margin-bottom: 8px; }
+    .card p { font-size: 13px; color: #94a3b8; line-height: 1.5; }
+  </style>
+</head>
+<body>
+  <h1>Financial Dashboard</h1>
+  <p class="subtitle">Choose a dashboard to open</p>
+  <div class="cards">
+    <a href="?view=classic" data-view="classic" class="card classic">
+      <div class="card-icon"><i class="fas fa-chart-pie"></i></div>
+      <h2>Classic Dashboard</h2>
+      <p>Charts, calendar, budgets, forecast, net worth, import and Labs.</p>
+    </a>
+    <a href="?view=sacred" data-view="sacred" class="card sacred">
+      <div class="card-icon"><i class="fas fa-gem"></i></div>
+      <h2>SACRED (Enhanced) Dashboard</h2>
+      <p>6 KPIs, Top Merchants, Recurring Candidates, Quick Actions, Insights and rail modals.</p>
+    </a>
+  </div>
+  <p class="subtitle" style="margin-top:24px;font-size:12px;">Or use the spreadsheet menu: Open Classic Dashboard / Open SACRED Dashboard</p>
+  <script>
+    (function() {
+      function isSheetDialog() {
+        try {
+          return typeof google !== 'undefined' && google.script && google.script.host && typeof google.script.host.close === 'function';
+        } catch (e) { return false; }
+      }
+      function goToView(view) {
+        if (isSheetDialog()) {
+          if (view === 'classic') {
+            google.script.run.withSuccessHandler(function() { google.script.host.close(); }).showDashboard();
+          } else {
+            google.script.run.withSuccessHandler(function() { google.script.host.close(); }).showSacredDashboard();
+          }
+          return;
+        }
+        var base = window.location.origin + window.location.pathname;
+        var sep = base.indexOf('?') === -1 ? '?' : '&';
+        var url = base + sep + 'view=' + view;
+        try {
+          window.location.href = url;
+        } catch (e) {
+          window.top.location.href = url;
+        }
+      }
+      document.addEventListener('DOMContentLoaded', function() {
+        try {
+          document.querySelectorAll('.card[data-view]').forEach(function(card) {
+            card.addEventListener('click', function(e) {
+              e.preventDefault();
+              goToView(card.getAttribute('data-view'));
+            });
+          });
+        } catch (err) {}
+      });
+    })();
+  </script>
+</body>
+</html>

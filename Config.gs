@@ -13,6 +13,9 @@ var CONFIG = {
     SPREADSHEET_ID: 'SPREADSHEET_ID'
   },
 
+  /** Max transactions returned in a single getDashboardData response (response size limit). */
+  MAX_TRANSACTIONS_RETURNED: 2500,
+
   /** Runtime constants: sheet names, currency, timezone, cache TTLs. */
   RUNTIME: {
     TRANSACTION_SHEET_NAME: 'Personal Account Transactions',

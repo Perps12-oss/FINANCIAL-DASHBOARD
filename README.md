@@ -1,14 +1,14 @@
 # Financial Dashboard
 
-Google Apps Script web app for a single-source financial overview: transactions, budgets, goals, analytics, and diagnostics, backed by a Google Sheet.
+A sheet-backed personal finance dashboard that gives a cleaner monthly picture, budget pressure signals, recurring spend awareness, and fast visual review—without forcing you to build pivots or charts manually. Backed by a single Google Sheet (Date, Description, Amount, Category).
 
 ---
 
 ## What it is
 
-- **Web app** served by Apps Script (`doGet`). Users open a URL and get either a Start page (choose Classic or SACRED) or a direct view (Classic or Sacred).
-- **Data source:** One Google Sheet with a transaction table (Date, Description, Amount, Category). Source is configured via Script Properties or in-app Settings; no “active spreadsheet” assumption in web.
-- **Two UIs:** **Classic** (full app: overview, transactions, analytics, budget, goals, calendar, settings, system, optional Labs) and **Sacred** (premium layout; same backend and data).
+- **Web app** served by Apps Script (`doGet`). Opening the app URL loads the **main dashboard** directly. Optional: `?view=start` for a minimal landing, `?view=sacred` for an enhanced layout (same data, different presentation).
+- **Data source:** One Google Sheet with a transaction table. Source is configured via Script Properties or in-app Settings; no “active spreadsheet” assumption in web.
+- **One product, one entrypoint.** Layout option (standard vs enhanced) is in the spreadsheet menu or via `?view=sacred`; it is not a primary user choice.
 
 ---
 
@@ -21,15 +21,15 @@ Google Apps Script web app for a single-source financial overview: transactions,
 | **Analytics** | Scatter, histogram, heatmaps, waterfall, 3D surface, Sankey, forecast, category trends. |
 | **Budget & goals** | Budget vs actual, smart suggestions, save plan; goals list and progress. |
 | **Calendar** | Month/week view, day drill-down, server-backed notes. |
-| **Settings & system** | Data source config, API key (for AI), theme; health, diagnostics, logs; “Show Labs” toggle. |
-| **Labs** (optional) | Import CSV, clear caches, test endpoints. |
+| **Settings & system** | Data source config, API key (for AI), theme; health, diagnostics, logs; optional Developer tools. |
+| **Developer** (hidden) | Import CSV, clear caches, test endpoints. Enable in Settings or `?dev=1`. |
 
 ---
 
 ## Architecture overview
 
 - **Backend:** Entrypoints (Code.gs) → Public API (Api.gs) → Data engine (Data.gs) + Config (Config.gs) + AI (AI.gs). Single transaction pipeline; all responses use the same envelope. See **docs/ARCHITECTURE.md**.
-- **Frontend:** Classic = Index.html (inlines Styles.html + JavaScript.html). One router, one API client, one state store; Sacred uses the same APIs.
+- **Frontend:** Main app = Index.html (Styles.html + JavaScript.html). One router, one API client, one state store. Enhanced layout (Sacred.html) uses the same APIs.
 - **Config:** Central constants in Config.gs; data source model: `mode`, `spreadsheetId`, `sheetName`, `schemaVersion`. Cache and invalidation: **docs/CACHE_MATRIX.md**.
 
 ---
@@ -75,18 +75,18 @@ Google Apps Script web app for a single-source financial overview: transactions,
 
 | URL / route | Page |
 |-------------|------|
-| `/exec` | Start (choose Classic or SACRED) |
-| `/exec?view=classic` | Classic dashboard |
-| `/exec?view=sacred` | Sacred dashboard |
-| Classic hash: `#dashboard`, `#transactions`, `#analytics`, `#budget`, `#goals`, `#calendar`, `#categories`, `#merchants`, `#insights`, `#forecast`, `#settings`, `#system`, `#labs` | Corresponding Classic pages |
+| `/exec` | Main dashboard (default) |
+| `/exec?view=start` | Minimal landing with “Open Dashboard” |
+| `/exec?view=sacred` | Same app, enhanced layout |
+| Hash routes: `#dashboard`, `#transactions`, `#analytics`, `#budget`, `#goals`, `#calendar`, `#categories`, `#merchants`, `#insights`, `#forecast`, `#settings`, `#system`, `#labs` | In-app pages |
 
-Labs is hidden unless enabled in System → Show Labs or `?labs=1`.
+Developer tools (Labs) are hidden unless enabled in Settings → Developer tools or `?dev=1` / `?labs=1`.
 
 ---
 
 ## Screenshots
 
-*(Add a short description or image links here when you have them, e.g. Start page, Classic overview, Sacred view.)*
+*(Add a short description or image links here when you have them.)*
 
 ---
 
@@ -104,7 +104,7 @@ Labs is hidden unless enabled in System → Show Labs or `?labs=1`.
 ├── JavaScript.html  # Client app
 ├── Styles.html      # CSS
 ├── Start.html       # Landing
-├── Sacred.html      # Sacred view
+├── Sacred.html      # Enhanced layout (optional)
 ├── appsscript.json  # Manifest
 ├── README.md        # This file
 ├── .gitignore

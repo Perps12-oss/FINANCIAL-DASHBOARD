@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Financial Dashboard – Start</title>
+  <title>Financial Dashboard</title>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" crossorigin="anonymous">
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -18,72 +18,40 @@
       justify-content: center;
       padding: 24px;
     }
-    h1 {
-      font-size: 28px;
-      font-weight: 700;
-      margin-bottom: 8px;
-      color: #fff;
-    }
-    .subtitle {
-      color: #8b949e;
-      font-size: 14px;
-      margin-bottom: 40px;
-    }
-    .cards {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 24px;
-      justify-content: center;
-      max-width: 720px;
-    }
-    .card {
-      background: rgba(30, 41, 59, 0.8);
-      border: 1px solid rgba(148, 163, 184, 0.2);
-      border-radius: 20px;
-      padding: 32px;
-      width: 280px;
-      text-align: center;
-      text-decoration: none;
-      color: inherit;
-      transition: transform 0.2s, box-shadow 0.2s, border-color 0.2s;
-    }
-    .card:hover {
-      transform: translateY(-4px);
-      box-shadow: 0 12px 40px rgba(0, 210, 255, 0.15);
-      border-color: rgba(0, 210, 255, 0.4);
-    }
-    .card-icon {
-      width: 56px;
-      height: 56px;
-      margin: 0 auto 20px;
-      border-radius: 14px;
-      display: flex;
+    h1 { font-size: 26px; font-weight: 700; margin-bottom: 8px; color: #fff; }
+    .subtitle { color: #8b949e; font-size: 14px; margin-bottom: 32px; }
+    .open-btn {
+      display: inline-flex;
       align-items: center;
-      justify-content: center;
-      font-size: 26px;
+      gap: 10px;
+      background: rgba(0, 210, 255, 0.2);
+      border: 1px solid rgba(0, 210, 255, 0.5);
+      border-radius: 12px;
+      padding: 16px 28px;
+      color: #00d2ff;
+      font-size: 16px;
+      font-weight: 600;
+      text-decoration: none;
+      transition: transform 0.2s, box-shadow 0.2s;
     }
-    .card.classic .card-icon { background: rgba(0, 210, 255, 0.2); color: #00d2ff; }
-    .card.sacred .card-icon { background: rgba(138, 43, 226, 0.2); color: #8a2be2; }
-    .card h2 { font-size: 18px; margin-bottom: 8px; }
-    .card p { font-size: 13px; color: #94a3b8; line-height: 1.5; }
+    .open-btn:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 8px 24px rgba(0, 210, 255, 0.2);
+    }
+    .footer { margin-top: 28px; font-size: 12px; color: #6b7280; }
+    .footer a { color: #94a3b8; text-decoration: none; }
+    .footer a:hover { text-decoration: underline; }
   </style>
 </head>
 <body>
   <h1>Financial Dashboard</h1>
-  <p class="subtitle">Choose a dashboard to open</p>
-  <div class="cards">
-    <a href="?view=classic" data-view="classic" class="card classic">
-      <div class="card-icon"><i class="fas fa-chart-pie"></i></div>
-      <h2>Classic Dashboard</h2>
-      <p>Charts, calendar, budgets, forecast, net worth, import and Labs.</p>
-    </a>
-    <a href="?view=sacred" data-view="sacred" class="card sacred">
-      <div class="card-icon"><i class="fas fa-gem"></i></div>
-      <h2>SACRED (Enhanced) Dashboard</h2>
-      <p>6 KPIs, Top Merchants, Recurring Candidates, Quick Actions, Insights and rail modals.</p>
-    </a>
-  </div>
-  <p class="subtitle" style="margin-top:24px;font-size:12px;">Or use the spreadsheet menu: Open Classic Dashboard / Open SACRED Dashboard</p>
+  <p class="subtitle">Sheet-backed overview, budgets, and insights</p>
+  <a href="?" id="open-dashboard" class="open-btn">
+    <i class="fas fa-chart-line"></i> Open Dashboard
+  </a>
+  <p class="footer">
+    <a href="?view=sacred" id="link-enhanced">Use enhanced layout</a>
+  </p>
   <script>
     (function() {
       function isSheetDialog() {
@@ -91,33 +59,24 @@
           return typeof google !== 'undefined' && google.script && google.script.host && typeof google.script.host.close === 'function';
         } catch (e) { return false; }
       }
-      function goToView(view) {
+      function goDashboard(enhanced) {
         if (isSheetDialog()) {
-          if (view === 'classic') {
-            google.script.run.withSuccessHandler(function() { google.script.host.close(); }).showDashboard();
-          } else {
+          if (enhanced) {
             google.script.run.withSuccessHandler(function() { google.script.host.close(); }).showSacredDashboard();
+          } else {
+            google.script.run.withSuccessHandler(function() { google.script.host.close(); }).showDashboard();
           }
           return;
         }
         var base = window.location.origin + window.location.pathname;
-        var sep = base.indexOf('?') === -1 ? '?' : '&';
-        var url = base + sep + 'view=' + view;
-        try {
-          window.location.href = url;
-        } catch (e) {
-          window.top.location.href = url;
-        }
+        var url = enhanced ? base + (base.indexOf('?') === -1 ? '?' : '&') + 'view=sacred' : base + (base.split('?')[0] || '');
+        try { window.location.href = url; } catch (e) { window.top.location.href = url; }
       }
       document.addEventListener('DOMContentLoaded', function() {
-        try {
-          document.querySelectorAll('.card[data-view]').forEach(function(card) {
-            card.addEventListener('click', function(e) {
-              e.preventDefault();
-              goToView(card.getAttribute('data-view'));
-            });
-          });
-        } catch (err) {}
+        var btn = document.getElementById('open-dashboard');
+        var link = document.getElementById('link-enhanced');
+        if (btn) btn.addEventListener('click', function(e) { e.preventDefault(); goDashboard(false); });
+        if (link) link.addEventListener('click', function(e) { e.preventDefault(); goDashboard(true); });
       });
     })();
   </script>

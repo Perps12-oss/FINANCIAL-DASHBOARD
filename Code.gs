@@ -24,9 +24,8 @@ function onOpen() {
   } catch (e) {}
   SpreadsheetApp.getUi()
     .createMenu('🚀 Financial Dashboard')
-    .addItem('Start menu (choose dashboard)', 'showStartMenu')
-    .addItem('Open Classic Dashboard', 'showDashboard')
-    .addItem('Open SACRED Dashboard', 'showSacredDashboard')
+    .addItem('Open Dashboard', 'showDashboard')
+    .addItem('Open in enhanced layout', 'showSacredDashboard')
     .addItem('Initialize System', 'setupSystem')
     .addSeparator()
     .addItem('Help & Setup', 'showHelp')
@@ -67,17 +66,19 @@ function doGet(e) {
   var param = (e && e.parameter) ? e.parameter : {};
   var view = (param.view || '').toLowerCase();
   var output;
+  // Single entrypoint: default = main dashboard. ?view=start = minimal landing; ?view=sacred = enhanced layout (theme option).
   if (view === 'sacred') {
     output = HtmlService.createHtmlOutputFromFile('Sacred')
-      .setTitle('SACRED Financial Dashboard')
+      .setTitle('Financial Dashboard')
       .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
-  } else if (view === 'classic') {
-    output = HtmlService.createTemplateFromFile('Index')
-      .evaluate()
+  } else if (view === 'start') {
+    output = HtmlService.createHtmlOutputFromFile('Start')
       .setTitle('Financial Dashboard')
       .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
   } else {
-    output = HtmlService.createHtmlOutputFromFile('Start')
+    // No view, or classic, or anything else → main dashboard
+    output = HtmlService.createTemplateFromFile('Index')
+      .evaluate()
       .setTitle('Financial Dashboard')
       .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
   }
@@ -96,20 +97,20 @@ function showDashboard() {
 }
 
 function showStartMenu() {
-  const html = HtmlService.createHtmlOutputFromFile('Start')
-    .setWidth(500)
-    .setHeight(380)
+  var html = HtmlService.createHtmlOutputFromFile('Start')
+    .setWidth(420)
+    .setHeight(260)
     .setTitle('Financial Dashboard');
-  SpreadsheetApp.getUi().showModalDialog(html, 'Choose dashboard');
+  SpreadsheetApp.getUi().showModalDialog(html, 'Financial Dashboard');
 }
 
-/** BOUND SPREADSHEET ONLY: opens SACRED dashboard in a modal dialog. */
+/** BOUND SPREADSHEET ONLY: opens enhanced-layout dashboard (optional theme). */
 function showSacredDashboard() {
   var html = HtmlService.createHtmlOutputFromFile('Sacred')
     .setWidth(1400)
     .setHeight(900)
-    .setTitle('SACRED Financial Dashboard');
-  SpreadsheetApp.getUi().showModalDialog(html, 'SACRED Financial Dashboard - Enhanced Edition');
+    .setTitle('Financial Dashboard');
+  SpreadsheetApp.getUi().showModalDialog(html, 'Financial Dashboard — Enhanced layout');
 }
 
 function include(filename) {

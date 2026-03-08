@@ -14,13 +14,8 @@
   <?!= include('Styles'); ?>
 </head>
 <body class="theme-sacred">
-  <div class="dashboard-switcher-bar">
-    <span class="switcher-label">Dashboard:</span>
-    <div class="switcher-pills">
-      <span class="switcher-pill active" aria-current="true">Classic</span>
-      <a class="switcher-pill" href="#" id="switch-to-sacred" title="Switch to SACRED (stays in app)">SACRED</a>
-    </div>
-    <span class="switcher-hint">Switch anytime without closing the app</span>
+  <div class="dashboard-switcher-bar hidden">
+    <a class="switcher-pill" href="?view=sacred" id="switch-to-enhanced" title="Open in enhanced layout">Enhanced layout</a>
   </div>
 
   <div id="loader" class="loader-overlay">
@@ -35,8 +30,8 @@
       <div class="brand">
         <div class="brand-logo"><i class="fas fa-chart-line"></i></div>
         <div>
-          <div class="brand-title">Classic Dashboard</div>
-          <div class="brand-subtitle">SACRED x Playful hybrid</div>
+          <div class="brand-title">Financial Dashboard</div>
+          <div class="brand-subtitle">Overview, budgets, insights</div>
         </div>
       </div>
 
@@ -53,7 +48,7 @@
         <button class="nav-link" data-route="forecast"><i class="fas fa-chart-line"></i><span>Forecast</span></button>
         <button class="nav-link" data-route="settings"><i class="fas fa-sliders"></i><span>Settings</span></button>
         <button class="nav-link" data-route="system"><i class="fas fa-shield-halved"></i><span>System</span></button>
-        <button id="nav-labs" class="nav-link hidden" data-route="labs" title="Enable via System → Show Labs or ?labs=1"><i class="fas fa-flask"></i><span>Labs</span></button>
+        <button id="nav-labs" class="nav-link hidden" data-route="labs" title="Enable in Settings → Developer tools or ?dev=1"><i class="fas fa-tools"></i><span>Developer</span></button>
       </nav>
     </aside>
 
@@ -61,7 +56,7 @@
       <header class="topbar glass-panel">
         <div>
           <div id="page-title" class="page-title">Dashboard</div>
-          <div id="page-subtitle" class="page-subtitle">Unified Classic experience powered by one transaction source.</div>
+          <div id="page-subtitle" class="page-subtitle">One transaction source — overview, budgets, insights.</div>
         </div>
         <div class="topbar-actions">
           <select id="range-select" class="control-select">
@@ -320,8 +315,8 @@
               <div class="panel-head">
                 <h3>Health report</h3>
                 <label class="control-toggle">
-                  <input type="checkbox" id="show-labs-toggle" title="Show Labs in sidebar (developer/debug)">
-                  <span>Show Labs</span>
+                  <input type="checkbox" id="show-labs-toggle" title="Show developer tools in sidebar">
+                  <span>Developer tools</span>
                 </label>
               </div>
               <div id="health-report" class="stack-list"></div>
@@ -346,7 +341,7 @@
         <section class="page" data-page="labs">
           <div class="page-grid two-col">
             <article class="panel glass-panel">
-              <div class="panel-head"><h3>Labs actions</h3></div>
+              <div class="panel-head"><h3>Developer</h3></div>
               <div class="button-column">
                 <button id="labs-test-btn" class="btn ghost">Run `testGetDashboardData`</button>
                 <button id="labs-clear-cache-btn" class="btn ghost">Clear caches</button>

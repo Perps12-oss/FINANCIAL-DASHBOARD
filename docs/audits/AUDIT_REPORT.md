@@ -1,5 +1,7 @@
 # Google Apps Script Financial Dashboard – Architecture Audit
 
+> **Historical audit.** Many items described here have been superseded by the current codebase (single pipeline, envelope contract, Config.gs, Tests.gs, no getActiveSpreadsheet in web path). For current design see **docs/ARCHITECTURE.md** and **docs/CACHE_MATRIX.md**.
+
 ## Executive Summary
 
 This audit identifies **performance**, **quota**, and **reliability** issues across the project. Critical bugs were found in the import flow, `_saveImportedTransactions`, and missing `_getSmartBudgetSuggestions`.

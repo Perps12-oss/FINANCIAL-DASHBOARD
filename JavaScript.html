@@ -24,6 +24,10 @@
       data: null,
       activeDate: null,
       activeDayData: null
+    },
+    buildInfo: {
+      version: 'webapp-hardening-v1',
+      loadedAt: new Date().toISOString()
     }
   };
 
@@ -51,6 +55,7 @@
   ];
 
   document.addEventListener('DOMContentLoaded', async () => {
+    restoreUiState();
     applyTheme(AppState.theme);
     bindGlobalUI();
     Router.init();
@@ -131,6 +136,31 @@
     var subtitleEl = document.getElementById('page-subtitle');
     if (titleEl) titleEl.textContent = meta[0];
     if (subtitleEl) subtitleEl.textContent = meta[1];
+  }
+
+  function saveUiState() {
+    try {
+      localStorage.setItem('classicRoute', AppState.route || 'dashboard');
+      localStorage.setItem('classicRange', AppState.range || '30d');
+      localStorage.setItem('classicFromIso', AppState.fromIso || '');
+      localStorage.setItem('classicToIso', AppState.toIso || '');
+    } catch (e) {}
+  }
+
+  function restoreUiState() {
+    try {
+      AppState.route = localStorage.getItem('classicRoute') || AppState.route;
+      AppState.range = localStorage.getItem('classicRange') || AppState.range;
+      AppState.fromIso = localStorage.getItem('classicFromIso') || '';
+      AppState.toIso = localStorage.getItem('classicToIso') || '';
+      var rangeEl = document.getElementById('range-select');
+      if (rangeEl) rangeEl.value = AppState.range;
+      var fromEl = document.getElementById('custom-from');
+      var toEl = document.getElementById('custom-to');
+      if (fromEl && AppState.fromIso) fromEl.value = AppState.fromIso;
+      if (toEl && AppState.toIso) toEl.value = AppState.toIso;
+      if (AppState.route && AppState.route !== 'dashboard') window.location.hash = AppState.route;
+    } catch (e) {}
   }
 
   function applyTheme(themeId) {
@@ -216,6 +246,7 @@
       AppState.fromIso = document.getElementById('custom-from').value || '';
       AppState.toIso = document.getElementById('custom-to').value || '';
     }
+    saveUiState();
   }
 
   const Router = {
@@ -228,6 +259,7 @@
     },
     go(route) {
       window.location.hash = route;
+      saveUiState();
     },
     render() {
       const route = (window.location.hash || '#dashboard').replace('#', '');
@@ -236,6 +268,7 @@
       document.querySelectorAll('.nav-link').forEach(link => link.classList.toggle('active', link.dataset.route === AppState.route));
       setPageMeta(AppState.route);
       ChartRenderer.renderForRoute(AppState.route);
+      saveUiState();
     }
   };
 
@@ -245,7 +278,7 @@
       try {
         await this.reloadAll();
       } catch (error) {
-        showToast(error.message, 'error');
+        showFatalError(error.message || 'Failed to initialize dashboard.');
       } finally {
         showLoader(false);
       }
@@ -273,31 +306,44 @@
           }
         }
         const opts = currentRangeOpts();
-        const [bundle, chartPack, txData, budgets, insights, calendarData] = await Promise.all([
-          serverCall('getClassicDashboardBundle', opts),
-          serverCall('getClassicChartPack', opts),
-          serverCall('getClassicTransactions', { ...opts, offset: 0, limit: AppState.transactions.pageSize }),
+        const [bootstrap, txData, budgets, insights, calendarData] = await Promise.all([
+          serverCall('apiGetAppBootstrap', opts),
+          serverCall('apiGetTransactionsPage', { ...opts, offset: 0, limit: AppState.transactions.pageSize }),
           serverCall('getBudgetsData', opts),
           serverCall('getAiFinancialInsights'),
           serverCall('getCalendarData', { view: AppState.calendar.view, anchorDate: AppState.calendar.anchorDate })
         ]);
-        if (!bundle.success) throw new Error(bundle.error || 'Failed to load dashboard bundle');
-        AppState.bundle = bundle.data;
-        AppState.chartPack = chartPack.data || {};
+        if (!bootstrap.ok) throw new Error((bootstrap.error && bootstrap.error.message) || 'Failed to load app bootstrap');
+        AppState.bundle = bootstrap.data.dashboard;
+        AppState.chartPack = bootstrap.data.charts || {};
         AppState.transactions.page = 1;
-        AppState.transactions.items = txData.data.transactions || [];
-        AppState.transactions.total = txData.data.total || 0;
-        AppState.transactions.categories = txData.data.categories || [];
+        AppState.transactions.items = (txData.data && txData.data.transactions) || [];
+        AppState.transactions.total = (txData.data && txData.data.total) || 0;
+        AppState.transactions.categories = (txData.data && txData.data.categories) || [];
         AppState.budgets = (budgets.data && budgets.data.budgets) || [];
         AppState.budgetChart = (budgets.data && budgets.data.chart) || { categories: [], actual: [] };
         AppState.insights = insights.data ? insights.data.text : '';
         AppState.calendar.data = calendarData.data || null;
+        clearFatalError();
         renderRangeBoundViews();
       } finally {
         if (showLoading) showLoader(false);
       }
     }
   };
+
+  function showFatalError(message) {
+    var box = document.getElementById('fatal-error');
+    var text = document.getElementById('fatal-error-message');
+    if (!box || !text) return;
+    text.textContent = message || 'Unknown error';
+    box.classList.remove('hidden');
+  }
+
+  function clearFatalError() {
+    var box = document.getElementById('fatal-error');
+    if (box) box.classList.add('hidden');
+  }
 
   function renderRangeBoundViews() {
     renderKpis();
@@ -971,6 +1017,8 @@
   const SystemModule = {
     bind() {
       document.getElementById('refresh-logs-btn').addEventListener('click', () => this.load());
+      var copyBtn = document.getElementById('copy-diagnostics-btn');
+      if (copyBtn) copyBtn.addEventListener('click', () => this.copyDiagnostics());
     },
 
     async load() {
@@ -998,6 +1046,28 @@
         <div class="signal-card"><strong>Cache age</strong><div class="muted">${escapeHtml(String(AppState.diagnostics.cacheAgeMs || 0))} ms</div></div>
       ` : '<div class="signal-card">Diagnostics unavailable.</div>';
       document.getElementById('system-logs').textContent = AppState.logs.length ? AppState.logs.map(entry => `[${entry.level}] ${entry.message || ''} (${entry.source || 'System'})`).join('\n') : 'No recent logs.';
+    },
+
+    copyDiagnostics() {
+      try {
+        var payload = {
+          buildInfo: AppState.buildInfo,
+          route: AppState.route,
+          range: currentRangeOpts(),
+          sourceInfo: AppState.sourceInfo || {},
+          diagnostics: AppState.diagnostics || {},
+          healthReport: AppState.healthReport || {},
+          lastLogs: (AppState.logs || []).slice(-10)
+        };
+        var content = JSON.stringify(payload, null, 2);
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(content).then(() => showToast('Diagnostics copied to clipboard.', 'success'));
+        } else {
+          showToast('Clipboard unavailable in this browser.', 'error');
+        }
+      } catch (e) {
+        showToast('Failed to copy diagnostics.', 'error');
+      }
     }
   };
 

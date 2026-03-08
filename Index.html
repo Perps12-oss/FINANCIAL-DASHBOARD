@@ -95,6 +95,10 @@
       </section>
 
       <section id="validation-banner" class="alert-banner hidden"></section>
+      <section id="fatal-error" class="alert-banner hidden" style="background:rgba(251,113,133,0.22);border-color:rgba(251,113,133,0.45);">
+        <strong>Dashboard initialization failed.</strong>
+        <div id="fatal-error-message"></div>
+      </section>
 
       <section class="content-shell">
         <section class="page active" data-page="dashboard">
@@ -321,7 +325,13 @@
               <div id="diagnostics-report" class="stack-list"></div>
             </article>
             <article class="panel glass-panel full-span">
-              <div class="panel-head"><h3>Recent logs</h3><button id="refresh-logs-btn" class="btn ghost small">Refresh</button></div>
+              <div class="panel-head">
+                <h3>Recent logs</h3>
+                <div class="button-row">
+                  <button id="copy-diagnostics-btn" class="btn ghost small">Copy diagnostics</button>
+                  <button id="refresh-logs-btn" class="btn ghost small">Refresh</button>
+                </div>
+              </div>
               <pre id="system-logs" class="log-view"></pre>
             </article>
           </div>

@@ -45,9 +45,9 @@
     merchants: ['Merchants', 'Merchant ranking and concentration analysis.'],
     insights: ['Insights', 'Recurring signals, quick actions, and AI summaries.'],
     forecast: ['Forecast', 'Projection view plus net-worth style account editing.'],
-    settings: ['Settings', 'Theme and source configuration for the rebuilt Classic app.'],
+    settings: ['Settings', 'Theme and source configuration.'],
     system: ['System', 'Health, diagnostics, and recent logs.'],
-    labs: ['Labs', 'Import, cache controls, and backend diagnostics.']
+    labs: ['Developer', 'Import, cache controls, and backend diagnostics.']
   };
 
   const ThemeOptions = [
@@ -169,7 +169,7 @@
       AppState.fromIso = localStorage.getItem('classicFromIso') || '';
       AppState.toIso = localStorage.getItem('classicToIso') || '';
       var params = new URLSearchParams(window.location.search);
-      AppState.showLabs = params.get('labs') === '1' || localStorage.getItem('classicShowLabs') === '1';
+      AppState.showLabs = params.get('labs') === '1' || params.get('dev') === '1' || localStorage.getItem('classicShowLabs') === '1';
       var rangeEl = document.getElementById('range-select');
       if (rangeEl) rangeEl.value = AppState.range;
       var fromEl = document.getElementById('custom-from');
@@ -214,9 +214,9 @@
     });
     var exportBtn = document.getElementById('export-btn');
     if (exportBtn) exportBtn.addEventListener('click', ExportModule.exportCsv);
-    var switchSacred = document.getElementById('switch-to-sacred');
-    if (switchSacred) {
-      switchSacred.addEventListener('click', function(e) {
+    var switchEnhanced = document.getElementById('switch-to-enhanced');
+    if (switchEnhanced) {
+      switchEnhanced.addEventListener('click', function(e) {
         e.preventDefault();
         var base = window.location.origin + window.location.pathname;
         window.top.location.href = base + (base.indexOf('?') === -1 ? '?' : '&') + 'view=sacred';
@@ -1052,7 +1052,7 @@
           AppState.showLabs = showLabsEl.checked;
           try { localStorage.setItem('classicShowLabs', AppState.showLabs ? '1' : '0'); } catch (e) {}
           updateLabsNavVisibility();
-          showToast(AppState.showLabs ? 'Labs visible in sidebar.' : 'Labs hidden from sidebar.');
+          showToast(AppState.showLabs ? 'Developer tools visible in sidebar.' : 'Developer tools hidden.');
         });
       }
     },
@@ -1258,7 +1258,7 @@
           detail: PageMeta[route][1],
           run: () => Router.go(route)
         })),
-        { label: 'Sync from source', detail: 'Refresh backend data and reload the Classic app.', run: () => document.getElementById('sync-btn').click() },
+        { label: 'Sync from source', detail: 'Refresh backend data and reload the dashboard.', run: () => document.getElementById('sync-btn').click() },
         { label: 'Export current range', detail: 'Download CSV for the selected range.', run: () => document.getElementById('export-btn').click() },
         { label: 'Reload diagnostics', detail: 'Refresh health, diagnostics, and logs.', run: () => SystemModule.load() }
       ];

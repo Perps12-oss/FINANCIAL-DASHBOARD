@@ -4,7 +4,7 @@
     <base target="_top">
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>SACRED Financial Dashboard - Enhanced Edition</title>
+    <title>Financial Dashboard — Enhanced layout</title>
     
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.plot.ly/plotly-2.24.1.min.js"></script>
@@ -770,12 +770,11 @@
 </head>
 <body>
     <div class="dashboard-switcher-bar sacred-switcher">
-        <span class="switcher-label">Dashboard:</span>
+        <span class="switcher-label">Layout:</span>
         <div class="switcher-pills">
-            <a class="switcher-pill" href="#" id="switch-to-classic" title="Switch to Classic (stays in app)">Classic</a>
-            <span class="switcher-pill active" aria-current="true">SACRED</span>
+            <a class="switcher-pill" href="#" id="switch-to-classic" title="Switch to standard layout">Standard</a>
+            <span class="switcher-pill active" aria-current="true">Enhanced</span>
         </div>
-        <span class="switcher-hint">Switch anytime without closing the app</span>
     </div>
     <div class="aurora-bg">
         <div class="aurora-blob blob-1"></div>
@@ -788,8 +787,8 @@
             <div class="nav-logo">
                 <div class="nav-logo-icon">S</div>
                 <div>
-                    <div class="nav-logo-text">SACRED</div>
-                    <div class="nav-subtitle">Financial Dashboard</div>
+                    <div class="nav-logo-text">Dashboard</div>
+                    <div class="nav-subtitle">Enhanced layout</div>
                 </div>
             </div>
         </div>
@@ -1757,7 +1756,7 @@
                         })
                         .getDashboardSummary(rangeOpts.range, rangeOpts.fromIso || null, rangeOpts.toIso || null);
                 } else {
-                    this.showEmptyState('Open this dashboard from Google Sheets (SACRED Dashboard menu → Open Enhanced Dashboard) to load real data.');
+                    this.showEmptyState('Open this dashboard from the spreadsheet menu (Financial Dashboard → Open in enhanced layout) or the web app with ?view=sacred to load data.');
                 }
             },
 
@@ -2460,7 +2459,7 @@
                 }
             });
 
-            ToastManager.show('SACRED Dashboard initialized successfully!', 'success');
+            ToastManager.show('Dashboard loaded.', 'success');
         }
 
         // Start the application

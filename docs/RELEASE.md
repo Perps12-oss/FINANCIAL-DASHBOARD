@@ -33,13 +33,16 @@ Branch flow, commit rules, deployment, and release tagging.
 |--------|---------|
 | **main** | Production-ready only. No direct messy work. |
 | **develop** | Integration branch. Feature branches merge here first. |
-| **feature/*** | One concern per branch, e.g. `feature/backend-contract-lockdown`, `feature/frontend-shell-rebuild`, `feature/repo-cleanup-release-process`. |
+| **feature/*** | One concern per branch, e.g. `feature/backend-contract-lockdown`, `feature/frontend-shell-rebuild`. |
+| **refactor/*** | Cleanup and architecture passes (e.g. `refactor/repo-truth-and-root-cleanup`, `refactor/backend-boundaries-and-contracts`, `refactor/frontend-shell-and-routing`, `refactor/docs-and-release-hygiene`). Merge to main after validation. |
+| **release/*** | Release-prep branch (e.g. `release/professionalization-pass`). Used to integrate phase branches and tag. |
 
 **Rules:**
 
 - No mixed-purpose commits.
 - Merge to develop after validation (e.g. backend tests, manual smoke).
 - Merge develop → main only when release-ready; then tag.
+- Refactor and release branches merge into main with `--no-ff` and a clear merge message.
 
 ---
 

@@ -30,7 +30,8 @@
       version: 'webapp-hardening-v1',
       loadedAt: new Date().toISOString()
     },
-    showLabs: false
+    showLabs: false,
+    systemLoadError: null
   };
 
   const PageMeta = {
@@ -1059,30 +1060,41 @@
     async load() {
       var showLabsEl = document.getElementById('show-labs-toggle');
       if (showLabsEl) showLabsEl.checked = AppState.showLabs;
-      const [health, diagnostics, logs] = await Promise.all([
-        serverCall('getHealthReport'),
-        serverCall('getDiagnostics'),
-        serverCall('getSystemLogEntries')
-      ]);
-      AppState.healthReport = health.data || null;
-      AppState.diagnostics = diagnostics || null;
-      AppState.logs = (logs && logs.entries) || [];
+      try {
+        const [health, diagnostics, logs] = await Promise.all([
+          serverCall('getHealthReport'),
+          serverCall('getDiagnostics'),
+          serverCall('getSystemLogEntries')
+        ]);
+        AppState.healthReport = (health && health.data) ? health.data : (health && typeof health.score === 'number' ? health : null);
+        AppState.diagnostics = diagnostics && (diagnostics.connection !== undefined || (diagnostics.data && diagnostics.data.connection)) ? diagnostics : null;
+        AppState.logs = (logs && (logs.entries || (logs.data && logs.data.entries))) || [];
+        AppState.systemLoadError = null;
+      } catch (e) {
+        AppState.healthReport = null;
+        AppState.diagnostics = null;
+        AppState.logs = [];
+        AppState.systemLoadError = e && e.message ? e.message : 'Failed to load system data.';
+      }
       this.render();
     },
 
     render() {
-      document.getElementById('health-report').innerHTML = AppState.healthReport ? `
+      var systemLoadError = AppState.systemLoadError;
+      document.getElementById('health-report').innerHTML = systemLoadError
+        ? '<div class="signal-card alert-banner">' + escapeHtml(systemLoadError) + '</div>'
+        : (AppState.healthReport ? `
         <div class="signal-card"><strong>Quality score</strong><div>${escapeHtml(String(AppState.healthReport.score))}/100</div></div>
         <div class="signal-card"><strong>Missing categories</strong><div>${escapeHtml(String(AppState.healthReport.issues.missingCategory || 0))}</div></div>
         <div class="signal-card"><strong>Possible duplicates</strong><div>${escapeHtml(String((AppState.healthReport.issues.duplicates || []).length))}</div></div>
         <div class="signal-card"><strong>Future dates</strong><div>${escapeHtml(String(AppState.healthReport.issues.futureDates || 0))}</div></div>
-      ` : '<div class="signal-card">Health report unavailable.</div>';
+      ` : '<div class="signal-card">Health report unavailable.</div>');
       document.getElementById('diagnostics-report').innerHTML = AppState.diagnostics ? `
         <div class="signal-card"><strong>Connection</strong><div class="muted">${escapeHtml(JSON.stringify(AppState.diagnostics.connection || {}))}</div></div>
         <div class="signal-card"><strong>Last error</strong><div class="muted">${escapeHtml(AppState.diagnostics.lastError ? JSON.stringify(AppState.diagnostics.lastError) : 'None')}</div></div>
         <div class="signal-card"><strong>Cache age</strong><div class="muted">${escapeHtml(String(AppState.diagnostics.cacheAgeMs || 0))} ms</div></div>
-      ` : '<div class="signal-card">Diagnostics unavailable.</div>';
-      document.getElementById('system-logs').textContent = AppState.logs.length ? AppState.logs.map(entry => `[${entry.level}] ${entry.message || ''} (${entry.source || 'System'})`).join('\n') : 'No recent logs.';
+      ` : (systemLoadError ? '<div class="signal-card muted">Diagnostics could not be loaded.</div>' : '<div class="signal-card">Diagnostics unavailable.</div>');
+      document.getElementById('system-logs').textContent = AppState.logs.length ? AppState.logs.map(entry => `[${entry.level || 'INFO'}] ${entry.message || ''} (${entry.module || entry.source || 'System'})`).join('\n') : 'No recent logs.';
     },
 
     copyDiagnostics() {

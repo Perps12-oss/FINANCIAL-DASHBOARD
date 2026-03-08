@@ -46,17 +46,17 @@ function _defaultKPIs_() {
 }
 
 /**
- * Returns: { success: boolean, data: object|null, error: string|null, meta: { fromCache, lastFetched, validation } }
+ * Returns: { ok, success, data, error, meta }
  * @param {boolean} [forceRefresh] - If true, bypass server cache and force fresh read for all sources.
  */
-var MAX_TRANSACTIONS_RETURNED = 2500;
+var MAX_TRANSACTIONS_RETURNED = (typeof CONFIG !== 'undefined' && CONFIG.MAX_TRANSACTIONS_RETURNED != null) ? CONFIG.MAX_TRANSACTIONS_RETURNED : 2500;
 
 /**
  * Classic dashboard payload. Uses SINGLE SOURCE OF TRUTH: _getTransactions() only.
  * No second read or validation step – whatever _getTransactions returns is what we return.
  */
 function getDashboardData(forceRefresh) {
-  var envelope = { success: false, data: null, error: null, meta: { fromCache: false, lastFetched: null, validation: { valid: true, errors: [], warnings: [] }, totalRows: 0, limit: MAX_TRANSACTIONS_RETURNED } };
+  var envelope = { ok: false, success: false, data: null, error: null, meta: { requestId: _requestId_(), version: _API_VERSION, fromCache: false, lastFetched: null, validation: { valid: true, errors: [], warnings: [] }, totalRows: 0, limit: MAX_TRANSACTIONS_RETURNED } };
   try {
     var useCache = forceRefresh !== true;
     var txResult = _getTransactions(useCache);
@@ -91,6 +91,7 @@ function getDashboardData(forceRefresh) {
       envelope.meta.validation.warnings = envelope.meta.validation.warnings || [];
       envelope.meta.validation.warnings.push('Showing latest ' + MAX_TRANSACTIONS_RETURNED + ' of ' + totalRows + ' transactions (limit for response size). KPIs use all ' + totalRows + '.');
     }
+    envelope.ok = true;
     envelope.success = true;
     envelope.data = {
       transactions: transactionsForClient,
@@ -102,8 +103,9 @@ function getDashboardData(forceRefresh) {
     };
     return envelope;
   } catch (e) {
-    envelope.error = e.message || 'Failed to load data';
-    _logSystem('ERROR', envelope.error, 'getDashboardData', e.stack);
+    var errMsg = e.message || 'Failed to load data';
+    _logSystem('ERROR', errMsg, 'getDashboardData', e.stack);
+    envelope.error = { code: 'DASHBOARD_LOAD_FAILED', message: errMsg };
     envelope.data = { transactions: [], settings: {}, budgets: {}, nw: { assets: [], liabilities: [] }, goals: [], kpis: _defaultKPIs_() };
     return envelope;
   }
@@ -122,7 +124,7 @@ function _validateSheetAccess_() {
 
 /**
  * Health check: reads a few rows and returns status. Call on app load to confirm connectivity.
- * Returns: { success: boolean, message: string, rowCount?: number, sheetName?: string }
+ * Returns standard envelope with legacy top-level keys for compat: { ok, success, data, message, rowCount, ... }.
  */
 function checkDataConnection() {
   var result = { success: false, message: '' };
@@ -134,11 +136,15 @@ function checkDataConnection() {
     result.sheetName = status.sheetName || _Config.RUNTIME.TRANSACTION_SHEET_NAME;
     result.code = status.code || (status.ok ? 'OK' : 'CONNECTION_FAILED');
     result.spreadsheetId = status.spreadsheetId || '';
-    return result;
+    var envelope = _ok_(result);
+    Object.keys(result).forEach(function(k) { envelope[k] = result[k]; });
+    return envelope;
   } catch (e) {
     result.message = e.message || 'Connection failed';
     _logSystem('ERROR', 'checkDataConnection: ' + result.message, 'checkDataConnection', e.stack);
-    return result;
+    var errEnvelope = _err_('CONNECTION_FAILED', result.message, null, result);
+    Object.keys(result).forEach(function(k) { errEnvelope[k] = result[k]; });
+    return errEnvelope;
   }
 }
 
@@ -154,20 +160,30 @@ function refreshAllData() {
 /**
  * Returns recent diagnostic log entries (from ScriptProperty DIAGNOSTIC_LOG).
  * For Labs: monitor and alert on failures.
+ * Returns standard envelope; legacy .entries preserved for compat.
  */
 function getSystemLogEntries() {
   try {
     var raw = PropertiesService.getScriptProperties().getProperty('DIAGNOSTIC_LOG');
-    if (!raw) return { success: true, entries: [] };
+    if (!raw) {
+      var out = _ok_({ entries: [] });
+      out.entries = [];
+      return out;
+    }
     var arr = JSON.parse(raw);
-    return { success: true, entries: arr };
+    var out = _ok_({ entries: arr });
+    out.entries = arr;
+    return out;
   } catch (e) {
-    return { success: false, entries: [], error: e.message };
+    var errOut = _err_('LOG_READ_FAILED', e.message, null, { entries: [] });
+    errOut.entries = [];
+    return errOut;
   }
 }
 
 /**
  * Returns diagnostics for Labs: connection status, last error, cache age.
+ * Returns standard envelope with legacy top-level keys for compat: { ok, data, connection, lastError, cacheAgeMs }.
  */
 function getDiagnostics() {
   var conn = checkDataConnection();
@@ -178,26 +194,31 @@ function getDiagnostics() {
     var err = arr.filter(function(x) { return x.level === 'ERROR'; });
     if (err.length) lastError = err[err.length - 1];
   } catch (e) {}
-  return {
+  var payload = {
     connection: conn,
     lastError: lastError,
     cacheAgeMs: _Config.lastFetchTime ? (Date.now() - _Config.lastFetchTime) : null
   };
+  var envelope = _ok_(payload);
+  envelope.connection = conn;
+  envelope.lastError = lastError;
+  envelope.cacheAgeMs = payload.cacheAgeMs;
+  return envelope;
 }
 
 /**
  * Test function for Apps Script: run testGetDashboardData() and check logs.
- * Returns: { success: boolean, envelope: object, error?: string }
+ * Returns standard envelope: { ok, data: { envelope }, error, meta }.
  */
 function testGetDashboardData() {
   try {
     var envelope = getDashboardData(false);
     Logger.log('testGetDashboardData: success=' + envelope.success + ', transactions=' + (envelope.data && envelope.data.transactions ? envelope.data.transactions.length : 0));
-    if (envelope.error) Logger.log('testGetDashboardData error: ' + envelope.error);
-    return { success: envelope.success, envelope: envelope, error: envelope.error };
+    if (envelope.error) Logger.log('testGetDashboardData error: ' + (envelope.error.message || envelope.error));
+    return envelope.ok ? _ok_({ envelope: envelope }) : _err_(envelope.error && envelope.error.code ? envelope.error.code : 'TEST_FAILED', envelope.error && envelope.error.message ? envelope.error.message : 'Dashboard load failed', null, { envelope: envelope });
   } catch (e) {
     Logger.log('testGetDashboardData threw: ' + e.message);
-    return { success: false, envelope: null, error: e.message };
+    return _err_('TEST_FAILED', e.message);
   }
 }
 
@@ -223,9 +244,9 @@ function getTransactionsPaginated(a, b, c, d, e) {
   return getTransactionsPaginatedOffsetLimit(a, b);
 }
 
-/** Classic dashboard: (offset, limit) -> { success, transactions, totalRows, hasMore }. */
+/** Classic dashboard: (offset, limit) -> { ok, success, data, transactions, totalRows, hasMore }. */
 function getTransactionsPaginatedOffsetLimit(offset, limit) {
-  var result = { success: false, transactions: [], totalRows: 0, hasMore: false };
+  var result = { ok: false, success: false, transactions: [], totalRows: 0, hasMore: false };
   try {
     var txResult = _getTransactions(true);
     var all = (txResult && txResult.transactions) ? txResult.transactions : [];
@@ -237,10 +258,15 @@ function getTransactionsPaginatedOffsetLimit(offset, limit) {
     result.totalRows = totalRows;
     result.hasMore = start + result.transactions.length < totalRows;
     result.success = true;
+    result.ok = true;
+    result.data = { transactions: result.transactions, totalRows: result.totalRows, hasMore: result.hasMore };
+    result.meta = { requestId: _requestId_(), version: _API_VERSION };
     return result;
   } catch (e) {
     result.error = e.message || 'Failed to load transactions';
     if (typeof _logSystem === 'function') _logSystem('ERROR', result.error, 'getTransactionsPaginatedOffsetLimit', e.stack);
+    result.data = { transactions: [], totalRows: 0, hasMore: false };
+    result.meta = { requestId: _requestId_(), version: _API_VERSION };
     return result;
   }
 }
@@ -303,6 +329,7 @@ function getClassicDashboardBundle(opts) {
       return { grade: 'Needs Attention', message: 'Negative cash flow detected.' };
     })(context.kpis);
     return {
+      ok: true,
       success: true,
       data: {
         kpis: context.kpis,
@@ -325,7 +352,7 @@ function getClassicDashboardBundle(opts) {
     };
   } catch (e) {
     if (typeof _logSystem === 'function') _logSystem('ERROR', 'getClassicDashboardBundle: ' + e.message, 'getClassicDashboardBundle', e.stack);
-    return { success: false, error: e.message, data: { kpis: _defaultKPIs_(), lists: { recentTransactions: [], topCategories: [], topMerchants: [], topIncomeSources: [], recurringCandidates: [] }, health: { grade: 'Unknown', message: 'No data.' }, meta: {} } };
+    return { ok: false, success: false, error: e.message, data: { kpis: _defaultKPIs_(), lists: { recentTransactions: [], topCategories: [], topMerchants: [], topIncomeSources: [], recurringCandidates: [] }, health: { grade: 'Unknown', message: 'No data.' }, meta: {} } };
   }
 }
 
@@ -335,10 +362,10 @@ function getClassicChartPack(opts) {
     var range = opts.range || '30d';
     var fromIso = opts.fromIso || opts.from || null;
     var toIso = opts.toIso || opts.to || null;
-    return { success: true, data: _buildClassicChartPack_(range, fromIso, toIso) };
+    return { ok: true, success: true, data: _buildClassicChartPack_(range, fromIso, toIso) };
   } catch (e) {
     if (typeof _logSystem === 'function') _logSystem('ERROR', 'getClassicChartPack: ' + e.message, 'getClassicChartPack', e.stack);
-    return { success: false, error: e.message, data: {} };
+    return { ok: false, success: false, error: e.message, data: {} };
   }
 }
 
@@ -377,10 +404,10 @@ function getClassicTransactions(opts) {
         type: amount >= 0 ? 'income' : 'expense'
       };
     });
-    return { success: true, data: { transactions: slice, total: list.length, categories: Array.from(new Set(context.filteredTransactions.map(function(tx) { return tx.category || 'Uncategorized'; }))).sort() } };
+    return { ok: true, success: true, data: { transactions: slice, total: list.length, categories: Array.from(new Set(context.filteredTransactions.map(function(tx) { return tx.category || 'Uncategorized'; }))).sort() } };
   } catch (e) {
     if (typeof _logSystem === 'function') _logSystem('ERROR', 'getClassicTransactions: ' + e.message, 'getClassicTransactions', e.stack);
-    return { success: false, error: e.message, data: { transactions: [], total: 0, categories: [] } };
+    return { ok: false, success: false, error: e.message, data: { transactions: [], total: 0, categories: [] } };
   }
 }
 

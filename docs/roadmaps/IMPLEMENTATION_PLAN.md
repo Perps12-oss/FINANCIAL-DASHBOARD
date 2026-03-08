@@ -11,7 +11,7 @@ This document compares your feature list to the current app, **ignores what is a
 - **Charts**: Running Balance (Plotly, area), Sankey, 3D Spending; built from filtered transactions; responsive.
 - **Recent Transactions**: List with search (client-side by name, category, date), **Load more** (server pagination via `getTransactionsPaginated`), color-coded amounts, click → detail modal.
 - **Navigation**: Fixed left rail (Dashboard, Calendar, Budgets, Forecast, Net Worth, Settings, Labs, Import).
-- **Budget**: Smart budget (suggestions), save plan; no full “Set budget” modal with add/remove/edit rows and period (monthly/weekly).
+- **Budget**: Smart budget (suggestions), save plan; no full "Set budget" modal with add/remove/edit rows and period (monthly/weekly).
 - **Sync**: Sync from source (clears server cache, refresh).
 - **Server**: `getDashboardData`, `getTransactionsPaginated`, `checkDataConnection`, `getSmartBudgets`, `fetchSankeyData`, `getMatrixData`, `getForecastData`, `saveFinalBudgets`, `saveNetWorth`, `processImportData`, `getAISuggestion`, settings/data source, etc.
 - **UI**: Glass styling, themes, toasts, modals (KPI detail, calendar day, import), FAB.
@@ -26,16 +26,16 @@ This document compares your feature list to the current app, **ignores what is a
 **1. Top Merchants list (high impact)**  
 - **What**: Panel showing merchant name, transaction count, total amount.  
 - **Why first**: Directly actionable (where you spend most), low complexity (aggregate from existing transactions).  
-- **Gap**: No “Top Merchants” panel or server endpoint.  
+- **Gap**: No "Top Merchants" panel or server endpoint.  
 - **Code**: Your implementation would help (data shape + UI).
 
 **2. Recurring Candidates list (high impact)**  
-- **What**: List of patterns detected from transactions (e.g. “Netflix £9.99 every month”).  
+- **What**: List of patterns detected from transactions (e.g. "Netflix £9.99 every month").  
 - **Why**: Surfaces subscriptions and recurring spend; high user value.  
 - **Gap**: No detection logic and no `getRecurringCandidatesData` (or similar) or UI.  
 - **Code**: Your code would help a lot (algorithm + API + UI).
 
-**3. Budget “Set budget” modal (medium–high impact)**  
+**3. Budget "Set budget" modal (medium–high impact)**  
 - **What**: Add/remove/edit budget rows: category, amount, period (monthly/weekly); save to server.  
 - **Why**: You have Smart budget and save plan, but not explicit category budgets with period.  
 - **Gap**: No modal for editing individual budget lines or period selector.  
@@ -49,18 +49,18 @@ This document compares your feature list to the current app, **ignores what is a
 
 **5. Insights panel (medium impact)**  
 - **What**: Auto-generated insights from KPIs (e.g. high savings rate, payday countdown).  
-- **Why**: You already have KPI detail modals; an Insights strip would surface “so what?” without opening modals.  
+- **Why**: You already have KPI detail modals; an Insights strip would surface "so what?" without opening modals.  
 - **Gap**: No dedicated insights UI; could derive from existing KPI/date logic.  
 - **Code**: Your copy and conditions would help.
 
 **6. Days Until Payday in KPI header (medium impact)**  
-- **What**: Sixth KPI card “Days Until Payday” with info modal.  
+- **What**: Sixth KPI card "Days Until Payday" with info modal.  
 - **Why**: In your list as a main KPI; currently only in server KPIs / detail, not in header.  
 - **Gap**: Header has 4 cards; add one card + modal.  
 - **Code**: Your card + modal text would help.
 
 **7. Net Cash Flow KPI card (medium impact)**  
-- **What**: Fifth card “Net Cash Flow” with summary modal.  
+- **What**: Fifth card "Net Cash Flow" with summary modal.  
 - **Why**: Complements Income/Expense; you can compute from existing KPIs.  
 - **Gap**: No Net Cash Flow card in header.  
 - **Code**: Your modal content would help.
@@ -79,7 +79,7 @@ This document compares your feature list to the current app, **ignores what is a
 
 **10. Range summary modal (medium impact)**  
 - **What**: Modal for selected period: total income, expenses, net cash flow, savings rate, top 5 income/expense.  
-- **Why**: “Weekly Review” and date-range summary in one place.  
+- **Why**: "Weekly Review" and date-range summary in one place.  
 - **Gap**: Filtered summary exists as inline bar; no modal with top 5.  
 - **Code**: Your layout and top-5 logic would help.
 
@@ -110,7 +110,7 @@ This document compares your feature list to the current app, **ignores what is a
 **15. Skeleton loaders for charts (low impact)**  
 - **What**: Placeholder blocks while chart data loads.  
 - **Why**: Better perceived performance.  
-- **Gap**: Loader is global “Loading data…”  
+- **Gap**: Loader is global "Loading data…"  
 - **Code**: Your skeleton markup/CSS would help.
 
 **16. Expandable nav submenus (medium impact)**  
@@ -139,12 +139,12 @@ This document compares your feature list to the current app, **ignores what is a
 
 **20. getAiFinancialInsights (optional)**  
 - **What**: Server or AI-generated insights.  
-- **Why**: You have getAISuggestion for category; full “insights” could power Insights panel.  
+- **Why**: You have getAISuggestion for category; full "insights" could power Insights panel.  
 - **Gap**: No dedicated insights API.  
 - **Code**: Your prompt/response shape would help.
 
 **21. getUncategorizedTransactionsData (medium impact)**  
-- **What**: List of transactions without category (or “Uncategorized”).  
+- **What**: List of transactions without category (or "Uncategorized").  
 - **Why**: Supports Transactions → Uncategorized and bulk categorisation.  
 - **Gap**: No endpoint or view.  
 - **Code**: Your API + list UI would help.

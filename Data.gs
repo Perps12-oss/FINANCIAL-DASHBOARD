@@ -1,106 +1,58 @@
 /**
- * CORE DATA ENGINE v2.0
- * Enhanced with caching, robust parsing, and smarter analytics.
+ * CORE DATA ENGINE — Single transaction pipeline and feature engines.
+ * All transaction reads flow: source → raw rows → _parseTransactions → _getTransactions → filter/aggregate.
+ * Config constants live in Config.gs (CONFIG). This module holds runtime state and source resolution.
  */
 
 const _Config = (function() {
-  // Constants
-  const RUNTIME = {
-    TRANSACTION_SHEET_NAME: 'Personal Account Transactions',
-    CURRENCY_SYMBOL: '£',
-    DEFAULT_TIMEZONE: 'Europe/London',
-    PAYDAY_DAY: 3,
-    MAX_CATEGORIES: 10,
-    CACHE_DURATION_MS: 60000, // runtime memory cache
-    CACHE_SERVICE_TTL_SEC: 240
-  };
-  
-  // Storage Keys
-  const KEYS = {
-    SETTINGS_PROP_KEY: 'USER_SETTINGS',
-    BUDGETS_PROP_KEY: 'USER_BUDGETS',
-    GOALS_PROP_KEY: 'USER_GOALS',
-    NET_WORTH_KEY: 'USER_NET_WORTH',
-    OPENAI_API_KEY: 'OPENAI_API_KEY',
-    LAST_REFRESH: 'LAST_REFRESH'
-  };
-  
-  // AI Configuration
-  const AI = {
-    PROVIDER: 'openai',
-    OPENAI: {
-      BASE: 'https://api.openai.com/v1/chat/completions',
-      MODEL: 'gpt-4o-mini'
-    },
-    TIMEOUT_MS: 10000
-  };
+  var RUNTIME = typeof CONFIG !== 'undefined' ? CONFIG.RUNTIME : { TRANSACTION_SHEET_NAME: 'Personal Account Transactions', CURRENCY_SYMBOL: '£', CACHE_DURATION_MS: 60000, CACHE_SERVICE_TTL_SEC: 240, PAYDAY_DAY: 3 };
+  var KEYS = typeof CONFIG !== 'undefined' ? CONFIG.KEYS : { SETTINGS_PROP_KEY: 'USER_SETTINGS', BUDGETS_PROP_KEY: 'USER_BUDGETS', GOALS_PROP_KEY: 'USER_GOALS', NET_WORTH_KEY: 'USER_NET_WORTH', OPENAI_API_KEY: 'OPENAI_API_KEY', LAST_REFRESH: 'LAST_REFRESH' };
+  var SCRIPT_KEY_DATA_SHEET_ID = typeof CONFIG !== 'undefined' ? CONFIG.SCRIPT_KEYS.DATA_SHEET_ID : 'DATA_SHEET_ID';
 
-  // Runtime Cache
-  let cachedTransactions_ = null;
-  let lastFetchTime_ = 0;
-  const cacheService_ = CacheService.getScriptCache();
-  
-  // Helper functions
-  function getUserProp_(key) { 
-    return PropertiesService.getUserProperties().getProperty(key); 
-  }
-  
-  function setUserProp_(key, value) { 
-    PropertiesService.getUserProperties().setProperty(key, value); 
-  }
+  var cacheService_ = CacheService.getScriptCache();
+  var cachedTransactions_ = null;
+  var lastFetchTime_ = 0;
 
-  /**
-   * Clears the in-memory transaction cache.
-   * Call this after saving new transactions.
-   */
+  function getUserProp_(key) {
+    return PropertiesService.getUserProperties().getProperty(key);
+  }
+  function setUserProp_(key, value) {
+    PropertiesService.getUserProperties().setProperty(key, value);
+  }
   function clearCache_() {
     cachedTransactions_ = null;
     lastFetchTime_ = 0;
     try {
-      cacheService_.removeAll([
-        'tx:parsed:v2',
-        'ctx:dashboard:v2',
-        'ctx:charts:v2',
-        'ctx:summary:v2'
-      ]);
+      cacheService_.removeAll(['tx:parsed:v2', 'ctx:dashboard:v2', 'ctx:charts:v2', 'ctx:summary:v2']);
     } catch (e) {}
   }
-
-  /**
-   * Formats a number as currency based on locale settings.
-   */
   function formatCurrency_(amount) {
-    return `${RUNTIME.CURRENCY_SYMBOL}${parseFloat(amount).toFixed(2)}`;
+    return (RUNTIME.CURRENCY_SYMBOL || '£') + parseFloat(amount).toFixed(2);
   }
   function getCacheKey_(scope, params) {
     var raw = scope + ':' + JSON.stringify(params || {});
-    var hash = Utilities.base64EncodeWebSafe(
-      Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, raw, Utilities.Charset.UTF_8)
-    ).slice(0, 24);
+    var hash = Utilities.base64EncodeWebSafe(Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, raw, Utilities.Charset.UTF_8)).slice(0, 24);
     return scope + ':' + hash;
   }
-
   function readCacheJson_(key) {
     try {
       var raw = cacheService_.get(key);
-      if (!raw) return null;
-      return JSON.parse(raw);
-    } catch (e) {
-      return null;
-    }
+      return raw ? JSON.parse(raw) : null;
+    } catch (e) { return null; }
   }
-
   function writeCacheJson_(key, value, ttlSec) {
     try {
       cacheService_.put(key, JSON.stringify(value), ttlSec || RUNTIME.CACHE_SERVICE_TTL_SEC);
     } catch (e) {}
   }
-
   function invalidateDashboardCaches_() {
     clearCache_();
   }
 
-  var SCRIPT_KEY_DATA_SHEET_ID = 'DATA_SHEET_ID';
+  /**
+   * Data source model: mode, spreadsheetId, sheetName, schemaVersion.
+   * Web app uses only this; no getActiveSpreadsheet().
+   */
   function getEffectiveDataSettings_() {
     var userJson = getUserProp_(KEYS.SETTINGS_PROP_KEY);
     var sheetName = RUNTIME.TRANSACTION_SHEET_NAME;
@@ -109,57 +61,27 @@ const _Config = (function() {
         var parsed = JSON.parse(userJson);
         if (parsed && parsed.sheetName) sheetName = String(parsed.sheetName).trim() || sheetName;
         if (parsed && parsed.mode === 'user_external' && parsed.spreadsheetId) {
-          return {
-            mode: 'user_external',
-            source: 'external',
-            externalId: String(parsed.spreadsheetId).trim(),
-            spreadsheetId: String(parsed.spreadsheetId).trim(),
-            sheetName: sheetName
-          };
+          return { mode: 'user_external', source: 'external', externalId: String(parsed.spreadsheetId).trim(), spreadsheetId: String(parsed.spreadsheetId).trim(), sheetName: sheetName, schemaVersion: (typeof CONFIG !== 'undefined' ? CONFIG.SCHEMA_VERSION : 1) };
         }
         if (parsed && parsed.source === 'external' && parsed.externalId) {
-          return {
-            mode: 'user_external',
-            source: 'external',
-            externalId: String(parsed.externalId).trim(),
-            spreadsheetId: String(parsed.externalId).trim(),
-            sheetName: sheetName
-          };
+          return { mode: 'user_external', source: 'external', externalId: String(parsed.externalId).trim(), spreadsheetId: String(parsed.externalId).trim(), sheetName: sheetName, schemaVersion: (typeof CONFIG !== 'undefined' ? CONFIG.SCHEMA_VERSION : 1) };
         }
       } catch (e) {}
     }
     var scriptId = PropertiesService.getScriptProperties().getProperty(SCRIPT_KEY_DATA_SHEET_ID);
     if (scriptId && scriptId.trim() !== '') {
-      return {
-        mode: 'script_default',
-        source: 'external',
-        externalId: scriptId.trim(),
-        spreadsheetId: scriptId.trim(),
-        sheetName: sheetName
-      };
+      return { mode: 'script_default', source: 'external', externalId: scriptId.trim(), spreadsheetId: scriptId.trim(), sheetName: sheetName, schemaVersion: (typeof CONFIG !== 'undefined' ? CONFIG.SCHEMA_VERSION : 1) };
     }
     var boundId = PropertiesService.getScriptProperties().getProperty('SPREADSHEET_ID');
     if (boundId && boundId.trim() !== '') {
-      return {
-        mode: 'script_default',
-        source: 'external',
-        externalId: boundId.trim(),
-        spreadsheetId: boundId.trim(),
-        sheetName: sheetName
-      };
+      return { mode: 'script_default', source: 'external', externalId: boundId.trim(), spreadsheetId: boundId.trim(), sheetName: sheetName, schemaVersion: (typeof CONFIG !== 'undefined' ? CONFIG.SCHEMA_VERSION : 1) };
     }
-    return {
-      mode: 'script_default',
-      source: 'none',
-      externalId: '',
-      spreadsheetId: '',
-      sheetName: sheetName
-    };
+    return { mode: 'script_default', source: 'none', externalId: '', spreadsheetId: '', sheetName: sheetName, schemaVersion: (typeof CONFIG !== 'undefined' ? CONFIG.SCHEMA_VERSION : 1) };
   }
   return {
-    RUNTIME,
-    KEYS,
-    AI,
+    RUNTIME: RUNTIME,
+    KEYS: KEYS,
+    AI: typeof CONFIG !== 'undefined' ? CONFIG.AI : {},
     SCRIPT_KEY_DATA_SHEET_ID: SCRIPT_KEY_DATA_SHEET_ID,
     getEffectiveDataSettings_,
     getUserProp_,
@@ -220,19 +142,21 @@ function _getTransactions(useCache) {
   }
 }
 
+/**
+ * Resolves the spreadsheet used for transaction data.
+ * Uses only explicit configuration: user settings (external ID) or script properties (DATA_SHEET_ID, SPREADSHEET_ID).
+ * Does NOT fall back to getActiveSpreadsheet() so that web app and bound contexts behave the same:
+ * if no ID is configured, the caller gets null and can show "No spreadsheet configured".
+ */
 function _resolveDataSpreadsheet_(settings) {
   if (settings && settings.source === 'external' && settings.externalId) {
     return SpreadsheetApp.openById(settings.externalId);
   }
   var scriptId = PropertiesService.getScriptProperties().getProperty(_Config.SCRIPT_KEY_DATA_SHEET_ID) ||
     PropertiesService.getScriptProperties().getProperty('SPREADSHEET_ID');
-  if (scriptId) {
-    return SpreadsheetApp.openById(scriptId);
+  if (scriptId && scriptId.trim()) {
+    return SpreadsheetApp.openById(scriptId.trim());
   }
-  try {
-    var active = SpreadsheetApp.getActiveSpreadsheet();
-    if (active) return active;
-  } catch (e) {}
   return null;
 }
 
@@ -323,6 +247,8 @@ function _getDataSourceMetadata_() {
   };
 }
 
+/* ─── FILTER ENGINE: range and list filters ─── */
+
 /**
  * Filter transactions by range. range: '7d'|'30d'|'90d'|'6m'|'1y'|'all'|'custom'.
  * For 'custom', fromIso and toIso must be YYYY-MM-DD.
@@ -353,6 +279,8 @@ function _filterTransactionsByRange(txs, range, fromIso, toIso) {
     return d >= start && d <= end;
   });
 }
+
+/* ─── DASHBOARD / SUMMARY ENGINE ─── */
 
 /**
  * Build dashboard summary for SACRED: KPIs + lists (recent, top merchants, top income, recurring).
@@ -418,6 +346,8 @@ function _getDashboardSummaryData(range, fromIso, toIso) {
     metadata: { range: range, fromIso: fromIso, toIso: toIso }
   };
 }
+
+/* ─── RECURRING DETECTION ENGINE ─── */
 
 /**
  * Recurring candidates: same description + same amount, at least 2 occurrences.
@@ -854,8 +784,10 @@ function _buildClassicChartPack_(range, fromIso, toIso) {
   return pack;
 }
 
+/* ─── CALENDAR ENGINE ─── */
+
 function _getCalendarNotesMap_() {
-  var raw = _Config.getUserProp_('USER_CALENDAR_NOTES') || '{}';
+  var raw = _Config.getUserProp_(_Config.KEYS.CALENDAR_NOTES || 'USER_CALENDAR_NOTES') || '{}';
   try { return JSON.parse(raw); } catch (e) { return {}; }
 }
 
@@ -1334,7 +1266,8 @@ function _saveImportedTransactions(data) {
   }
   
   const startRow = sheet.getLastRow() + 1;
-  sheet.getRange(startRow, 1, newRows.length, 4).setValues(newRows);
+  const endRow = startRow + newRows.length - 1;
+  sheet.getRange(startRow, 1, endRow, 4).setValues(newRows);
   
   // 4. Clear cache so next fetch includes new data
   _Config.invalidateDashboardCaches_();

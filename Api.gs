@@ -1,31 +1,34 @@
 /**
  * PUBLIC API ENDPOINTS
- * All google.script.run calls go here.
+ * All google.script.run calls go here. No business logic; delegate to Data.gs / AI.gs.
  *
- * SINGLE SOURCE OF TRUTH: Data.gs _getTransactions(useCache) is the only place that reads
- * transaction data. getDashboardData (Classic) and getDashboardSummary (SACRED) both use
- * it; neither does a second "validation" read. Dashboards request what they need from this.
- *
- * RETURN ENVELOPE (getDashboardData, refreshAllData):
- *   { success: boolean, data: object|null, error: string|null, meta: { fromCache, lastFetched, validation } }
- *   data: { transactions: [], settings: {}, budgets: {}, nw: {}, goals: [], kpis: {} }
- *
- * checkDataConnection(): { success: boolean, message: string, rowCount?: number, sheetName?: string }
- * getDiagnostics(): { connection: checkResult, lastError: object|null, cacheAgeMs: number|null }
- * getSystemLogEntries(): { success: boolean, entries: Array<{t,level,message,source,detail}> }
+ * CONTRACT: Every public method returns the same envelope:
+ *   { ok: boolean, data: object|null, error: null|{ code, message }, meta: { requestId, version [, cache ] } }
  */
 
+var _API_VERSION = (typeof CONFIG !== 'undefined' && CONFIG.API_VERSION) ? CONFIG.API_VERSION : '1.0';
+
+function _requestId_() {
+  return Utilities.getUuid().slice(0, 8);
+}
+
 function _ok_(data, meta) {
-  return { ok: true, success: true, data: data == null ? null : data, error: null, meta: meta || {} };
+  var m = meta || {};
+  if (m.requestId == null) m.requestId = _requestId_();
+  if (m.version == null) m.version = _API_VERSION;
+  return { ok: true, success: true, data: data == null ? null : data, error: null, meta: m };
 }
 
 function _err_(code, message, meta, data) {
+  var m = meta || {};
+  if (m.requestId == null) m.requestId = _requestId_();
+  if (m.version == null) m.version = _API_VERSION;
   return {
     ok: false,
     success: false,
     data: data == null ? null : data,
     error: { code: code || 'UNKNOWN_ERROR', message: message || 'Unknown error' },
-    meta: meta || {}
+    meta: m
   };
 }
 
@@ -960,6 +963,7 @@ function apiGetAppBootstrap(opts) {
     var toIso = opts.toIso || null;
     var connection = _testDataSourceConnection_();
     if (!connection.ok) return _err_(connection.code, connection.message, { phase: 'bootstrap' }, { connection: connection });
+    var cacheStatus = _Config.cachedTransactions ? 'hit' : 'miss';
     var bundle = getClassicDashboardBundle({ range: range, fromIso: fromIso, toIso: toIso });
     var charts = getClassicChartPack({ range: range, fromIso: fromIso, toIso: toIso });
     var settings = loadUserSettings();
@@ -970,7 +974,7 @@ function apiGetAppBootstrap(opts) {
       charts: charts.data || null,
       settings: settings.data || {},
       source: source.data || {}
-    }, { phase: 'bootstrap' });
+    }, { phase: 'bootstrap', cache: cacheStatus });
   } catch (e) {
     return _err_('BOOTSTRAP_FAILED', e.message || 'Bootstrap failed', { phase: 'bootstrap' });
   }

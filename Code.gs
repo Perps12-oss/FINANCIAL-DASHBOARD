@@ -1,8 +1,20 @@
 /**
- * MAIN ENTRY POINT
- * Financial Dashboard SaaS - Consolidated Version
+ * MAIN ENTRY POINT — Financial Dashboard
+ *
+ * This file has two distinct contexts. Do not mix their assumptions.
+ *
+ * ─── WEB APP (doGet) ───
+ * - Only doGet(e) runs. No SpreadsheetApp.getActiveSpreadsheet(), no getUi().
+ * - Serves Start.html, Index (Classic), or Sacred.html by ?view= param.
+ * - Data resolution is via script properties / user settings only (see Data.gs).
+ *
+ * ─── BOUND SPREADSHEET (menu / dialogs) ───
+ * - onOpen(), setupSystem(), showHelp(), showDashboard(), showStartMenu(), showSacredDashboard().
+ * - These require SpreadsheetApp.getUi() and optionally getActiveSpreadsheet().
+ * - Only used when the script is bound to a Sheet and the user opens the menu.
  */
 
+/** BOUND SPREADSHEET ONLY: builds menu when the container spreadsheet is opened. */
 function onOpen() {
   try {
     var ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -20,18 +32,35 @@ function onOpen() {
     .addItem('Help & Setup', 'showHelp')
     .addSubMenu(SpreadsheetApp.getUi().createMenu('Labs')
       .addItem('Run health check', 'runHealthCheck')
-      .addItem('Run testGetDashboardData', 'runTestGetDashboardData'))
+      .addItem('Run testGetDashboardData', 'runTestGetDashboardData')
+      .addItem('Run backend tests', 'runBackendTests'))
     .addToUi();
 }
 
+/** BOUND SPREADSHEET ONLY: runs health check and shows alert. */
 function runHealthCheck() {
   var result = checkDataConnection();
-  SpreadsheetApp.getUi().alert(result.success ? 'Health check OK.\n' + (result.rowCount !== undefined ? result.rowCount + ' rows in sheet.' : '') : 'Health check failed: ' + result.message);
+  var ui = SpreadsheetApp.getUi();
+  if (ui) ui.alert(result.success ? 'Health check OK.\n' + (result.rowCount !== undefined ? result.rowCount + ' rows in sheet.' : '') : 'Health check failed: ' + result.message);
 }
 
+/** BOUND SPREADSHEET ONLY: runs testGetDashboardData and shows alert. */
 function runTestGetDashboardData() {
   var result = testGetDashboardData();
-  SpreadsheetApp.getUi().alert(result.success ? 'testGetDashboardData passed. Check View > Logs for details.' : 'testGetDashboardData failed: ' + (result.error || 'unknown'));
+  var ui = SpreadsheetApp.getUi();
+  if (ui) ui.alert(result.success ? 'testGetDashboardData passed. Check View > Logs for details.' : 'testGetDashboardData failed: ' + (result.error || 'unknown'));
+}
+
+/** BOUND SPREADSHEET ONLY: runs backend regression tests (Tests.gs). */
+function runBackendTests() {
+  try {
+    var r = runAllBackendTests_();
+    var ui = SpreadsheetApp.getUi();
+    if (ui) ui.alert('Backend tests: ' + r.passed + ' passed, ' + r.failed + ' failed.');
+  } catch (e) {
+    var ui = SpreadsheetApp.getUi();
+    if (ui) ui.alert('runBackendTests error: ' + (e.message || e));
+  }
 }
 
 function doGet(e) {
@@ -57,8 +86,9 @@ function doGet(e) {
     .addMetaTag('fd-runtime', 'web-app');
 }
 
+/** BOUND SPREADSHEET ONLY: opens Classic dashboard in a modal dialog. */
 function showDashboard() {
-  const html = HtmlService.createTemplateFromFile('Index')
+  var html = HtmlService.createTemplateFromFile('Index')
     .evaluate()
     .setWidth(1400)
     .setHeight(900);
@@ -73,8 +103,9 @@ function showStartMenu() {
   SpreadsheetApp.getUi().showModalDialog(html, 'Choose dashboard');
 }
 
+/** BOUND SPREADSHEET ONLY: opens SACRED dashboard in a modal dialog. */
 function showSacredDashboard() {
-  const html = HtmlService.createHtmlOutputFromFile('Sacred')
+  var html = HtmlService.createHtmlOutputFromFile('Sacred')
     .setWidth(1400)
     .setHeight(900)
     .setTitle('SACRED Financial Dashboard');
@@ -85,33 +116,11 @@ function include(filename) {
   return HtmlService.createHtmlOutputFromFile(filename).getContent();
 }
 
-function isWebAppRequest_(e) {
-  return !!(e && e.parameter);
-}
-
-function getConfiguredSpreadsheetId_() {
-  var settings = _Config.getEffectiveDataSettings_();
-  if (settings && settings.source === 'external' && settings.externalId) return settings.externalId;
-  var scriptId = PropertiesService.getScriptProperties().getProperty(_Config.SCRIPT_KEY_DATA_SHEET_ID);
-  if (scriptId && scriptId.trim()) return scriptId.trim();
-  var boundId = PropertiesService.getScriptProperties().getProperty('SPREADSHEET_ID');
-  return boundId ? String(boundId).trim() : '';
-}
-
-function assertConfiguredDataSource_() {
-  var id = getConfiguredSpreadsheetId_();
-  if (!id) {
-    return {
-      ok: false,
-      code: 'CONFIG_MISSING',
-      message: 'No spreadsheet configured. Set DATA_SHEET_ID in Script Properties or run Initialize System in the bound spreadsheet.'
-    };
-  }
-  return { ok: true, spreadsheetId: id };
-}
-
+/** BOUND SPREADSHEET ONLY: initializes sheets and sample data. Not used in web app. */
 function setupSystem() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  var ui = SpreadsheetApp.getUi();
+  if (!ui) return;
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
   if (ss) {
     PropertiesService.getScriptProperties().setProperty('SPREADSHEET_ID', ss.getId());
   }
@@ -146,5 +155,5 @@ function showHelp() {
       <p><b>📊 Features:</b> 3D Charts, Calendar, Forecast, Net Worth, Import</p>
     </div>
   `).setWidth(460).setHeight(420);
-  SpreadsheetApp.getUi().showModalDialog(html, 'Help & Setup');
+  ui.showModalDialog(html, 'Help & Setup');
 }

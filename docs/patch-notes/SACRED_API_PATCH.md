@@ -44,4 +44,4 @@ So you do **not** need to rename to `getTransactionsPaginatedWithRange` or chang
 3. Deploy: `clasp push`.
 4. In the spreadsheet menu: **Financial Dashboard** → **Open Enhanced (SACRED) Dashboard**.
 
-The dialog will load Sacred.html and call the new APIs; data comes from the same “Personal Account Transactions” sheet and Script Properties (e.g. `DATA_SHEET_ID`, budgets, net worth).
+The dialog will load Sacred.html and call the new APIs; data comes from the same "Personal Account Transactions" sheet and Script Properties (e.g. `DATA_SHEET_ID`, budgets, net worth).

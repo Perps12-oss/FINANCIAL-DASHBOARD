@@ -10,19 +10,19 @@ The repo was reviewed for **bottlenecks** and **cache constraints** that could p
 
 ### Server-side cache (Data.gs)
 
-- **Issue:** `_getTransactions(useCache = true)` uses a 1‑minute in-memory cache. After import, settings change (e.g. switching data source), or “Sync”, the server could still return stale data for up to 1 minute because `getDashboardData()` did not accept a “skip cache” flag.
+- **Issue:** `_getTransactions(useCache = true)` uses a 1‑minute in-memory cache. After import, settings change (e.g. switching data source), or "Sync", the server could still return stale data for up to 1 minute because `getDashboardData()` did not accept a "skip cache" flag.
 - **Fix:**
   - **Api.gs:** `getDashboardData(forceRefresh)` now takes an optional boolean. When `forceRefresh === true`, it calls `_getTransactions(false)` so the sheet is read again.
   - **Api.gs:** `updateDataSource()` now calls `_Config.clearCache_()` so the next read uses the new sheet.
 
 ### Client-side cache (JavaScript.html)
 
-- **Issue:** `loadDashboardData(forceRefresh)` skips `sessionStorage` when `forceRefresh` is true, but the server was still using its cache, so “refresh” could show stale data.
+- **Issue:** `loadDashboardData(forceRefresh)` skips `sessionStorage` when `forceRefresh` is true, but the server was still using its cache, so "refresh" could show stale data.
 - **Fix:** When the client calls with `forceRefresh`, it now passes that to the server: `getDashboardData(forceRefresh)`.
 
 ### Sync and post-import flow
 
-- **Issue:** “Sync Now” (`manualSync`) called `getDashboardData()` with no argument, so the server cache was used and data could be up to 1 minute old.
+- **Issue:** "Sync Now" (`manualSync`) called `getDashboardData()` with no argument, so the server cache was used and data could be up to 1 minute old.
 - **Fix:** `manualSync` now calls `getDashboardData(true)` so the server bypasses its cache.
 
 ---
@@ -41,7 +41,7 @@ The repo was reviewed for **bottlenecks** and **cache constraints** that could p
 - **Fix:** Added null checks in:
   - `setQuickRange`, `applyDateFilter`, `updateFilteredSummary`, `renderFilteredCharts`, `clearFilter`
   - `updateSyncUI` (works when only `sync-button` exists; `sync-icon` is optional)
-- **Optional:** To enable the date filter and sync button in the UI, add the corresponding inputs and container to `Index.html` (see DUMP files for example markup).
+- **Optional:** To enable the date filter and sync button in the UI, add the corresponding inputs and container to Index.html (see DUMP files for example markup).
 
 ---
 

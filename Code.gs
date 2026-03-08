@@ -142,7 +142,9 @@ function setupSystem() {
 }
 
 function showHelp() {
-  const html = HtmlService.createHtmlOutput(`
+  var ui = SpreadsheetApp.getUi();
+  if (!ui) return;
+  var html = HtmlService.createHtmlOutput(`
     <div style="padding:20px;font-family:sans-serif">
       <h2>📋 Quick Setup Guide</h2>
       <p><b>Default data source:</b> Data is pulled from an <b>external sheet</b> when you set <code>DATA_SHEET_ID</code> in <b>Script Properties</b> (Project settings → Script properties). Use your transaction spreadsheet’s ID (from its URL). If not set, the app uses the current (bound) sheet.</p>

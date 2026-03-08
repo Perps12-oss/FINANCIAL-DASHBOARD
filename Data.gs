@@ -11,7 +11,8 @@ const _Config = (function() {
     DEFAULT_TIMEZONE: 'Europe/London',
     PAYDAY_DAY: 3,
     MAX_CATEGORIES: 10,
-    CACHE_DURATION_MS: 60000 // 1 minute cache for script runtime
+    CACHE_DURATION_MS: 60000, // runtime memory cache
+    CACHE_SERVICE_TTL_SEC: 240
   };
   
   // Storage Keys
@@ -37,6 +38,7 @@ const _Config = (function() {
   // Runtime Cache
   let cachedTransactions_ = null;
   let lastFetchTime_ = 0;
+  const cacheService_ = CacheService.getScriptCache();
   
   // Helper functions
   function getUserProp_(key) { 
@@ -54,6 +56,14 @@ const _Config = (function() {
   function clearCache_() {
     cachedTransactions_ = null;
     lastFetchTime_ = 0;
+    try {
+      cacheService_.removeAll([
+        'tx:parsed:v2',
+        'ctx:dashboard:v2',
+        'ctx:charts:v2',
+        'ctx:summary:v2'
+      ]);
+    } catch (e) {}
   }
 
   /**
@@ -62,18 +72,89 @@ const _Config = (function() {
   function formatCurrency_(amount) {
     return `${RUNTIME.CURRENCY_SYMBOL}${parseFloat(amount).toFixed(2)}`;
   }
+  function getCacheKey_(scope, params) {
+    var raw = scope + ':' + JSON.stringify(params || {});
+    var hash = Utilities.base64EncodeWebSafe(
+      Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, raw, Utilities.Charset.UTF_8)
+    ).slice(0, 24);
+    return scope + ':' + hash;
+  }
+
+  function readCacheJson_(key) {
+    try {
+      var raw = cacheService_.get(key);
+      if (!raw) return null;
+      return JSON.parse(raw);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function writeCacheJson_(key, value, ttlSec) {
+    try {
+      cacheService_.put(key, JSON.stringify(value), ttlSec || RUNTIME.CACHE_SERVICE_TTL_SEC);
+    } catch (e) {}
+  }
+
+  function invalidateDashboardCaches_() {
+    clearCache_();
+  }
+
   var SCRIPT_KEY_DATA_SHEET_ID = 'DATA_SHEET_ID';
   function getEffectiveDataSettings_() {
     var userJson = getUserProp_(KEYS.SETTINGS_PROP_KEY);
+    var sheetName = RUNTIME.TRANSACTION_SHEET_NAME;
     if (userJson && userJson.trim() !== '') {
       try {
         var parsed = JSON.parse(userJson);
-        if (parsed && ((parsed.source === 'external' && parsed.externalId) || parsed.source === 'active')) return parsed;
+        if (parsed && parsed.sheetName) sheetName = String(parsed.sheetName).trim() || sheetName;
+        if (parsed && parsed.mode === 'user_external' && parsed.spreadsheetId) {
+          return {
+            mode: 'user_external',
+            source: 'external',
+            externalId: String(parsed.spreadsheetId).trim(),
+            spreadsheetId: String(parsed.spreadsheetId).trim(),
+            sheetName: sheetName
+          };
+        }
+        if (parsed && parsed.source === 'external' && parsed.externalId) {
+          return {
+            mode: 'user_external',
+            source: 'external',
+            externalId: String(parsed.externalId).trim(),
+            spreadsheetId: String(parsed.externalId).trim(),
+            sheetName: sheetName
+          };
+        }
       } catch (e) {}
     }
     var scriptId = PropertiesService.getScriptProperties().getProperty(SCRIPT_KEY_DATA_SHEET_ID);
-    if (scriptId && scriptId.trim() !== '') return { source: 'external', externalId: scriptId.trim() };
-    return { source: 'active' };
+    if (scriptId && scriptId.trim() !== '') {
+      return {
+        mode: 'script_default',
+        source: 'external',
+        externalId: scriptId.trim(),
+        spreadsheetId: scriptId.trim(),
+        sheetName: sheetName
+      };
+    }
+    var boundId = PropertiesService.getScriptProperties().getProperty('SPREADSHEET_ID');
+    if (boundId && boundId.trim() !== '') {
+      return {
+        mode: 'script_default',
+        source: 'external',
+        externalId: boundId.trim(),
+        spreadsheetId: boundId.trim(),
+        sheetName: sheetName
+      };
+    }
+    return {
+      mode: 'script_default',
+      source: 'none',
+      externalId: '',
+      spreadsheetId: '',
+      sheetName: sheetName
+    };
   }
   return {
     RUNTIME,
@@ -85,6 +166,10 @@ const _Config = (function() {
     setUserProp_,
     clearCache_,
     formatCurrency_,
+    getCacheKey_,
+    readCacheJson_,
+    writeCacheJson_,
+    invalidateDashboardCaches_,
     get cachedTransactions() { return cachedTransactions_; },
     set cachedTransactions(val) { cachedTransactions_ = val; },
     get lastFetchTime() { return lastFetchTime_; },
@@ -101,11 +186,24 @@ const _Config = (function() {
  */
 function _getTransactions(useCache) {
   if (useCache === undefined) useCache = true;
+  var cacheKey = 'tx:parsed:v2';
   var now = Date.now();
   if (useCache && _Config.cachedTransactions && (now - _Config.lastFetchTime < _Config.RUNTIME.CACHE_DURATION_MS)) {
     return { transactions: _Config.cachedTransactions, totalRows: _Config.cachedTransactions.length, validation: { valid: true, errors: [], warnings: [] } };
   }
   try {
+    if (useCache) {
+      var cached = _Config.readCacheJson_(cacheKey);
+      if (cached && Array.isArray(cached.transactions)) {
+        _Config.cachedTransactions = cached.transactions;
+        _Config.lastFetchTime = now;
+        return {
+          transactions: cached.transactions,
+          totalRows: cached.transactions.length,
+          validation: cached.validation || { valid: true, errors: [], warnings: [] }
+        };
+      }
+    }
     var rawResult = _getCoreTransactionData();
     if (rawResult.error) {
       return { transactions: [], totalRows: 0, validation: { valid: false, errors: [rawResult.error], warnings: [] } };
@@ -114,11 +212,28 @@ function _getTransactions(useCache) {
     var parsed = parseResult.transactions || [];
     _Config.cachedTransactions = parsed;
     _Config.lastFetchTime = now;
+    _Config.writeCacheJson_(cacheKey, { transactions: parsed, validation: parseResult.validation || { valid: true, errors: [], warnings: [] } }, _Config.RUNTIME.CACHE_SERVICE_TTL_SEC);
     return { transactions: parsed, totalRows: parsed.length, validation: parseResult.validation || { valid: true, errors: [], warnings: [] } };
   } catch (e) {
     if (typeof _logSystem === 'function') _logSystem('ERROR', '_getTransactions failed: ' + e.message, '_getTransactions', e.stack);
     return { transactions: [], totalRows: 0, validation: { valid: false, errors: [e.message], warnings: [] } };
   }
+}
+
+function _resolveDataSpreadsheet_(settings) {
+  if (settings && settings.source === 'external' && settings.externalId) {
+    return SpreadsheetApp.openById(settings.externalId);
+  }
+  var scriptId = PropertiesService.getScriptProperties().getProperty(_Config.SCRIPT_KEY_DATA_SHEET_ID) ||
+    PropertiesService.getScriptProperties().getProperty('SPREADSHEET_ID');
+  if (scriptId) {
+    return SpreadsheetApp.openById(scriptId);
+  }
+  try {
+    var active = SpreadsheetApp.getActiveSpreadsheet();
+    if (active) return active;
+  } catch (e) {}
+  return null;
 }
 
 /**
@@ -134,38 +249,78 @@ function _getCoreTransactionData() {
     return { rows: [], error: 'Configuration error: ' + (e.message || 'unknown') };
   }
   try {
-    if (settings.source === 'external' && settings.externalId) {
-      ss = SpreadsheetApp.openById(settings.externalId);
-    } else {
-      try {
-        ss = SpreadsheetApp.getActiveSpreadsheet();
-      } catch (activeErr) {
-        var scriptId = PropertiesService.getScriptProperties().getProperty('SPREADSHEET_ID') || PropertiesService.getScriptProperties().getProperty(_Config.SCRIPT_KEY_DATA_SHEET_ID);
-        if (scriptId) ss = SpreadsheetApp.openById(scriptId);
-        else return { rows: [], error: 'Set Script Property DATA_SHEET_ID, or open the bound spreadsheet and run Initialize System.' };
-      }
-    }
-    if (!ss) return { rows: [], error: 'Spreadsheet not found.' };
-    sheet = ss.getSheetByName(_Config.RUNTIME.TRANSACTION_SHEET_NAME);
+    ss = _resolveDataSpreadsheet_(settings);
+    if (!ss) return { rows: [], error: 'No spreadsheet configured. Set Script Property DATA_SHEET_ID or run Initialize System in the bound spreadsheet.' };
+    sheet = ss.getSheetByName((settings && settings.sheetName) ? settings.sheetName : _Config.RUNTIME.TRANSACTION_SHEET_NAME);
     if (!sheet) {
-      if (typeof _logSystem === 'function') _logSystem('WARN', 'Sheet not found: ' + _Config.RUNTIME.TRANSACTION_SHEET_NAME, '_getCoreTransactionData');
-      return { rows: [], error: "Sheet '" + _Config.RUNTIME.TRANSACTION_SHEET_NAME + "' not found in the spreadsheet." };
+      if (typeof _logSystem === 'function') _logSystem('WARN', 'Sheet not found: ' + ((settings && settings.sheetName) ? settings.sheetName : _Config.RUNTIME.TRANSACTION_SHEET_NAME), '_getCoreTransactionData');
+      return { rows: [], error: "Sheet '" + ((settings && settings.sheetName) ? settings.sheetName : _Config.RUNTIME.TRANSACTION_SHEET_NAME) + "' not found in the spreadsheet." };
     }
     return { rows: sheet.getDataRange().getValues() };
   } catch (e) {
     if (typeof _logSystem === 'function') _logSystem('ERROR', 'Connection error: ' + e.message, '_getCoreTransactionData', e.stack);
-    try {
-      var scriptId = PropertiesService.getScriptProperties().getProperty('SPREADSHEET_ID') || PropertiesService.getScriptProperties().getProperty(_Config.SCRIPT_KEY_DATA_SHEET_ID);
-      if (scriptId) {
-        ss = SpreadsheetApp.openById(scriptId);
-        sheet = ss.getSheetByName(_Config.RUNTIME.TRANSACTION_SHEET_NAME);
-        return { rows: sheet ? sheet.getDataRange().getValues() : [] };
-      }
-    } catch (e2) {
-      if (typeof _logSystem === 'function') _logSystem('ERROR', 'Fallback read failed: ' + e2.message, '_getCoreTransactionData');
-    }
     return { rows: [], error: e.message || 'Connection failed.' };
   }
+}
+
+function _validateTransactionHeaders_(headers) {
+  var normalized = (headers || []).map(function(h) { return String(h || '').toLowerCase().trim(); });
+  var required = ['date', 'description', 'amount'];
+  var missing = required.filter(function(r) { return normalized.indexOf(r) === -1; });
+  return {
+    ok: missing.length === 0,
+    missing: missing,
+    headers: normalized
+  };
+}
+
+function _testDataSourceConnection_() {
+  var settings = _Config.getEffectiveDataSettings_();
+  if (!settings.spreadsheetId) {
+    return { ok: false, code: 'CONFIG_MISSING', message: 'No spreadsheet configured.' };
+  }
+  try {
+    var ss = SpreadsheetApp.openById(settings.spreadsheetId);
+    var sheetName = settings.sheetName || _Config.RUNTIME.TRANSACTION_SHEET_NAME;
+    var sheet = ss.getSheetByName(sheetName);
+    if (!sheet) return { ok: false, code: 'SHEET_MISSING', message: "Sheet '" + sheetName + "' not found.", spreadsheetId: settings.spreadsheetId, spreadsheetName: ss.getName() };
+    var values = sheet.getDataRange().getValues();
+    var headerValidation = _validateTransactionHeaders_(values[0] || []);
+    if (!headerValidation.ok) {
+      return {
+        ok: false,
+        code: 'INVALID_HEADERS',
+        message: 'Missing required headers: ' + headerValidation.missing.join(', '),
+        spreadsheetId: settings.spreadsheetId,
+        spreadsheetName: ss.getName(),
+        rowCount: Math.max(0, values.length - 1)
+      };
+    }
+    return {
+      ok: true,
+      code: 'OK',
+      message: 'Connection successful.',
+      spreadsheetId: settings.spreadsheetId,
+      spreadsheetName: ss.getName(),
+      sheetName: sheetName,
+      rowCount: Math.max(0, values.length - 1),
+      headers: headerValidation.headers
+    };
+  } catch (e) {
+    return { ok: false, code: 'CONNECTION_FAILED', message: e.message || 'Connection failed.', spreadsheetId: settings.spreadsheetId || '' };
+  }
+}
+
+function _getDataSourceMetadata_() {
+  var settings = _Config.getEffectiveDataSettings_();
+  var test = _testDataSourceConnection_();
+  return {
+    mode: settings.mode || 'script_default',
+    source: settings.source || 'none',
+    spreadsheetId: settings.spreadsheetId || '',
+    sheetName: settings.sheetName || _Config.RUNTIME.TRANSACTION_SHEET_NAME,
+    status: test
+  };
 }
 
 /**
@@ -575,6 +730,9 @@ function _getForecastSeries_(txs) {
 }
 
 function _buildDashboardContext_(range, fromIso, toIso) {
+  var cacheKey = _Config.getCacheKey_('ctx:dashboard:v2', { range: range || '30d', fromIso: fromIso || null, toIso: toIso || null });
+  var cached = _Config.readCacheJson_(cacheKey);
+  if (cached && cached.kpis && cached.filteredTransactions) return cached;
   var resolved = _resolveRangeBounds_(range || '30d', fromIso || null, toIso || null);
   var txResult = _getTransactions(true);
   var allTransactions = (txResult && txResult.transactions) ? txResult.transactions : [];
@@ -592,7 +750,7 @@ function _buildDashboardContext_(range, fromIso, toIso) {
   var projectedDaysToZero = burnRate > 0 ? Math.floor(currentBalance / burnRate) : null;
   var monthly = _groupTransactionsByMonth_(sortedTransactions);
   var daily = _groupTransactionsByDay_(sortedTransactions);
-  return {
+  var context = {
     range: range || '30d',
     fromIso: resolved.fromIso,
     toIso: resolved.toIso,
@@ -621,9 +779,14 @@ function _buildDashboardContext_(range, fromIso, toIso) {
     recurringCandidates: _getRecurringCandidatesList(sortedTransactions),
     recentTransactions: _getRecentTransactions_(sortedTransactions, 50)
   };
+  _Config.writeCacheJson_(cacheKey, context, _Config.RUNTIME.CACHE_SERVICE_TTL_SEC);
+  return context;
 }
 
 function _buildClassicChartPack_(range, fromIso, toIso) {
+  var cacheKey = _Config.getCacheKey_('ctx:charts:v2', { range: range || '30d', fromIso: fromIso || null, toIso: toIso || null });
+  var cached = _Config.readCacheJson_(cacheKey);
+  if (cached && cached.runningBalance) return cached;
   var context = _buildDashboardContext_(range, fromIso, toIso);
   var txs = context.sortedTransactions;
   var running = 0;
@@ -662,7 +825,7 @@ function _buildClassicChartPack_(range, fromIso, toIso) {
   var merchants = context.topMerchants.map(function(merchant) {
     return { name: merchant.name, amount: merchant.amount, transactions: merchant.transactions };
   });
-  return {
+  var pack = {
     runningBalance: runningBalance,
     categoryDonut: context.topCategories.map(function(category) {
       return { category: category.category, amount: category.amount };
@@ -687,6 +850,8 @@ function _buildClassicChartPack_(range, fromIso, toIso) {
     sankey: sankey,
     merchants: merchants
   };
+  _Config.writeCacheJson_(cacheKey, pack, _Config.RUNTIME.CACHE_SERVICE_TTL_SEC);
+  return pack;
 }
 
 function _getCalendarNotesMap_() {
@@ -1156,33 +1321,23 @@ function _saveImportedTransactions(data) {
   var settings = _Config.getEffectiveDataSettings_();
   var ss;
   try {
-    if (settings.source === 'external' && settings.externalId) {
-      ss = SpreadsheetApp.openById(settings.externalId);
-    } else {
-      try {
-        ss = SpreadsheetApp.getActiveSpreadsheet();
-      } catch (activeErr) {
-        var scriptId = PropertiesService.getScriptProperties().getProperty('SPREADSHEET_ID') || PropertiesService.getScriptProperties().getProperty(_Config.SCRIPT_KEY_DATA_SHEET_ID);
-        if (scriptId) ss = SpreadsheetApp.openById(scriptId);
-      }
-    }
+    ss = _resolveDataSpreadsheet_(settings);
     if (!ss) return { success: false, count: 0, message: "Database connection failed." };
   } catch (e) {
     return { success: false, count: 0, message: "Database connection failed." };
   }
   
-  let sheet = ss.getSheetByName(_Config.RUNTIME.TRANSACTION_SHEET_NAME);
+  let sheet = ss.getSheetByName(settings.sheetName || _Config.RUNTIME.TRANSACTION_SHEET_NAME);
   if (!sheet) {
-    sheet = ss.insertSheet(_Config.RUNTIME.TRANSACTION_SHEET_NAME);
+    sheet = ss.insertSheet(settings.sheetName || _Config.RUNTIME.TRANSACTION_SHEET_NAME);
     sheet.appendRow(['Date', 'Description', 'Amount', 'Category']);
   }
   
   const startRow = sheet.getLastRow() + 1;
-  const endRow = startRow + newRows.length - 1;
-  sheet.getRange(startRow, 1, endRow, 4).setValues(newRows);
+  sheet.getRange(startRow, 1, newRows.length, 4).setValues(newRows);
   
   // 4. Clear cache so next fetch includes new data
-  _Config.clearCache_();
+  _Config.invalidateDashboardCaches_();
   _Config.setUserProp_(_Config.KEYS.LAST_REFRESH, new Date().toISOString());
   
   return { success: true, count: newRows.length };

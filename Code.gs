@@ -52,7 +52,9 @@ function doGet(e) {
       .setTitle('Financial Dashboard')
       .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
   }
-  return output.addMetaTag('viewport', 'width=device-width, initial-scale=1');
+  return output
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1')
+    .addMetaTag('fd-runtime', 'web-app');
 }
 
 function showDashboard() {
@@ -81,6 +83,31 @@ function showSacredDashboard() {
 
 function include(filename) {
   return HtmlService.createHtmlOutputFromFile(filename).getContent();
+}
+
+function isWebAppRequest_(e) {
+  return !!(e && e.parameter);
+}
+
+function getConfiguredSpreadsheetId_() {
+  var settings = _Config.getEffectiveDataSettings_();
+  if (settings && settings.source === 'external' && settings.externalId) return settings.externalId;
+  var scriptId = PropertiesService.getScriptProperties().getProperty(_Config.SCRIPT_KEY_DATA_SHEET_ID);
+  if (scriptId && scriptId.trim()) return scriptId.trim();
+  var boundId = PropertiesService.getScriptProperties().getProperty('SPREADSHEET_ID');
+  return boundId ? String(boundId).trim() : '';
+}
+
+function assertConfiguredDataSource_() {
+  var id = getConfiguredSpreadsheetId_();
+  if (!id) {
+    return {
+      ok: false,
+      code: 'CONFIG_MISSING',
+      message: 'No spreadsheet configured. Set DATA_SHEET_ID in Script Properties or run Initialize System in the bound spreadsheet.'
+    };
+  }
+  return { ok: true, spreadsheetId: id };
 }
 
 function setupSystem() {

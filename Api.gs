@@ -1021,6 +1021,17 @@ function apiSaveSettings(payload) {
   }
 }
 
+function apiSaveApiKeyMasked(payload) {
+  try {
+    var apiKey = payload && payload.apiKey ? String(payload.apiKey).trim() : '';
+    if (!apiKey) return _err_('API_KEY_REQUIRED', 'API key is required');
+    _Config.setUserProp_(_Config.KEYS.OPENAI_API_KEY, apiKey);
+    return _ok_({ saved: true, masked: apiKey.slice(0, 3) + '...' + apiKey.slice(-4) });
+  } catch (e) {
+    return _err_('API_KEY_SAVE_FAILED', e.message || 'Failed to save API key');
+  }
+}
+
 function apiGetDashboardSummary(opts) {
   try {
     opts = opts || {};
@@ -1135,12 +1146,14 @@ function _logSystem(level, message, source, detail) {
   try {
     Logger.log(JSON.stringify(entry));
   } catch (e) {}
-  try {
-    var settings = _Config.getEffectiveDataSettings_();
-    var ss = settings.spreadsheetId ? SpreadsheetApp.openById(settings.spreadsheetId) : null;
-    var logSheet = ss ? ss.getSheetByName('_SystemLog') : null;
-    if (logSheet) logSheet.appendRow([new Date(), level, message, sourceName, requestId].concat(detail ? [String(detail).slice(0, 2000)] : []));
-  } catch (e) {}
+  if (level === 'ERROR' || level === 'WARN') {
+    try {
+      var settings = _Config.getEffectiveDataSettings_();
+      var ss = settings.spreadsheetId ? SpreadsheetApp.openById(settings.spreadsheetId) : null;
+      var logSheet = ss ? ss.getSheetByName('_SystemLog') : null;
+      if (logSheet) logSheet.appendRow([new Date(), level, message, sourceName, requestId].concat(detail ? [String(detail).slice(0, 2000)] : []));
+    } catch (e) {}
+  }
   try {
     var key = 'DIAGNOSTIC_LOG';
     var maxEntries = 50;

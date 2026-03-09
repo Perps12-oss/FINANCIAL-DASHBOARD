@@ -1,6 +1,5 @@
-**/**
-!*.gs
-!*.js
-!*.html
-!appsscript.json
-!.clasp.json
+node_modules/**
+.git/**
+docs/**
+archive/**
+*.md

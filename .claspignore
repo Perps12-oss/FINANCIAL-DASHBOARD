@@ -1,5 +1,7 @@
-node_modules/**
-.git/**
-docs/**
-archive/**
-*.md
+# Ignore everything
+**
+
+# Allow Apps Script runtime files
+!*.js
+!*.html
+!appsscript.json

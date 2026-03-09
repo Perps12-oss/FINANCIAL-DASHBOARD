@@ -1,9 +1,3 @@
-<style>
-/* GENERATED FILE - DO NOT EDIT DIRECTLY
- * Source: frontend/styles.css
- * Build: npm run build  OR  node scripts/build-frontend.js
- */
-
 /* Design tokens: spacing (--topbar-gap, --sidebar-width), typography (body/Inter), radii (--radius), shadows (--shadow), colors (--bg, --panel, --text, --muted, --primary, --success, --warning, --danger). Use these for consistency. */
   :root {
     --bg: #081225;
@@ -858,4 +852,3 @@
       flex-direction: column;
     }
   }
-</style>

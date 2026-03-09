@@ -294,6 +294,16 @@
               <div id="theme-swatches" class="theme-swatches"></div>
             </article>
             <article class="panel glass-panel">
+              <div class="panel-head"><h3>Pay day & balance</h3></div>
+              <div class="form-grid">
+                <label for="payday-day">Pay day (day of month, 1–31)</label>
+                <input id="payday-day" class="control-input" type="number" min="1" max="31" placeholder="3">
+                <label for="balance-override">Current balance override (optional)</label>
+                <input id="balance-override" class="control-input" type="number" step="0.01" placeholder="Leave empty to use computed from transactions">
+              </div>
+              <p class="muted">Pay day is used for “days to payday”. Balance override replaces the computed running balance when set.</p>
+            </article>
+            <article class="panel glass-panel">
               <div class="panel-head"><h3>Data source</h3></div>
               <div class="form-grid">
                 <select id="source-type" class="control-select">

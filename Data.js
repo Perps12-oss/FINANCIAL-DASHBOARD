@@ -966,6 +966,13 @@ function _calculateKPIs(txs) {
     var income = currentMonthTxs.filter(function(t) { return t.amount > 0; }).reduce(function(s, t) { return s + t.amount; }, 0);
     var expense = Math.abs(currentMonthTxs.filter(function(t) { return t.amount < 0; }).reduce(function(s, t) { return s + t.amount; }, 0));
     var totalBalance = list.reduce(function(s, t) { return s + t.amount; }, 0);
+    var balanceOverride = null;
+    try {
+      var raw = _Config.getUserProp_(_Config.KEYS.SETTINGS_PROP_KEY) || '{}';
+      var s = JSON.parse(raw);
+      if (s.balanceOverride != null && s.balanceOverride !== '' && !isNaN(Number(s.balanceOverride))) balanceOverride = Number(s.balanceOverride);
+    } catch (e) {}
+    var displayBalance = balanceOverride != null ? balanceOverride : totalBalance;
     var savingsRate = income > 0 ? ((income - expense) / income) * 100 : 0;
     var threeMonthsAgo = new Date();
     threeMonthsAgo.setMonth(threeMonthsAgo.getMonth() - 3);
@@ -974,7 +981,7 @@ function _calculateKPIs(txs) {
     var totalRecentIncome = recentTxs.filter(function(t) { return t.amount > 0; }).reduce(function(s, t) { return s + t.amount; }, 0);
     var totalRecentExpense = Math.abs(recentTxs.filter(function(t) { return t.amount < 0; }).reduce(function(s, t) { return s + t.amount; }, 0));
     return {
-      balance: totalBalance.toFixed(2),
+      balance: Number(displayBalance).toFixed(2),
       income: income.toFixed(2),
       expense: expense.toFixed(2),
       savingsRate: savingsRate.toFixed(1),
@@ -988,21 +995,32 @@ function _calculateKPIs(txs) {
   }
 }
 
+/** User-editable pay day (1–31). From USER_SETTINGS.paydayDay or RUNTIME.PAYDAY_DAY. */
+function _getEffectivePaydayDay_() {
+  try {
+    var raw = _Config.getUserProp_(_Config.KEYS.SETTINGS_PROP_KEY) || '{}';
+    var s = JSON.parse(raw);
+    var d = parseInt(s.paydayDay, 10);
+    if (d >= 1 && d <= 31) return d;
+  } catch (e) {}
+  return _Config.RUNTIME.PAYDAY_DAY;
+}
+
 /**
  * Enhanced Payday Calculator with Weekend Handling
  */
 function _getDaysToPayday() {
+  var paydayDay = _getEffectivePaydayDay_();
   const now = new Date();
   let year = now.getFullYear();
   let month = now.getMonth();
-  
-  // Determine target month
-  if (now.getDate() >= _Config.RUNTIME.PAYDAY_DAY) {
+
+  if (now.getDate() >= paydayDay) {
     month++;
     if (month > 11) { month = 0; year++; }
   }
-  
-  let payday = new Date(year, month, _Config.RUNTIME.PAYDAY_DAY);
+
+  let payday = new Date(year, month, paydayDay);
   
   // Adjust for weekends (move to Friday if Sat/Sun)
   const dayOfWeek = payday.getDay();
